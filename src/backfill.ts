@@ -3,6 +3,7 @@ import { DataSourceBuilder } from '@subsquid/evm-stream'
 import { Database } from '@subsquid/file-store'
 import { createLogger } from '@subsquid/logger'
 import { blockFromEnv, loadConfig, required } from './config'
+import { markPartial } from './coverage'
 import { openDest } from './dest'
 import { configuredContracts, Registry } from './discover'
 import { portalSource } from './portal'
@@ -30,10 +31,14 @@ async function main() {
   const followed = [...new Set([...configuredContracts(config), ...registry.contracts].map((c) => c.address))]
   const addresses = followed.filter((a) => !only || only.includes(a))
   if (addresses.length === 0) throw new Error('no contracts to backfill')
+  const from = blockFromEnv('FROM_BLOCK')
+  if (only || from !== undefined) {
+    await markPartial(openDest(lakeDest, config.dataset), `a development backfill: LAKE_ADDRESSES=${only?.join(',') ?? ''} FROM_BLOCK=${from ?? ''}`)
+  }
 
   const builder = new DataSourceBuilder()
     .setPortal(portalSource(config.dataset))
-    .setBlockRange({ from: blockFromEnv('FROM_BLOCK') ?? config.fromBlock, to })
+    .setBlockRange({ from: from ?? config.fromBlock, to })
     .setFields({
       block: { timestamp: true, parentHash: true },
       log: { address: true, topics: true, data: true, transactionHash: true },

@@ -31,6 +31,8 @@ The followed contracts are the configured ones, the factories, and every contrac
 
 ```
 <lake>/<dataset>/contracts.json
+<lake>/<dataset>/backfill.json                            once the backfill is complete: the block it reached and the contracts it covered
+<lake>/<dataset>/partial.txt                              left by development runs that skip history
 <lake>/<dataset>/chunks/status.txt                        the last block written
 <lake>/<dataset>/chunks/<from>-<to>/blocks.parquet
 <lake>/<dataset>/chunks/<from>-<to>/logs.parquet
@@ -51,11 +53,20 @@ Spark.
 | `serve` | Serves a local lake as it is |
 
 A dataset starts with `discover` and `backfill`. From then on `live` keeps it up to date and serves
-it. `live` is the image's default command.
+it. `live` is the image's default command, and runs the first two on its own: a dataset whose
+backfill is not complete is discovered and backfilled from the SQD portal before it is followed, and
+an interrupted backfill resumes where it stopped. Once complete, the dataset is marked with
+`backfill.json`, and `live` never reads the SQD portal for it again.
+
+`live` refuses to serve a dataset whose lake is missing history:
+
+- one that a development run wrote with `LAKE_ADDRESSES` or `FROM_BLOCK`, which leaves `partial.txt`;
+- one whose config gained a contract after its backfill, since the lake holds none of that contract's history.
 
 One `live` process runs a follower per dataset and a single portal, so one service covers both
 chains of an environment: `DATASETS=ethereum-mainnet,polygon-mainnet`. Each dataset has a single
-writer, so a dataset is followed by one process at a time.
+writer, so a dataset is followed by one process at a time. A deployment usually starts the new task
+before it stops the old one, so `live` waits `WRITER_GRACE_MS` before it writes anything.
 
 When a chain's RPC node fails or falls behind, only that dataset's follower stops, and it retries
 until the node answers again; the portal keeps serving everything it has. Any other failure ends the
@@ -78,7 +89,7 @@ npm run build
 export DATASET=polygon-mainnet LAKE_DEST=./data
 npm run discover                      # STOP_BLOCK=<block> to stop early
 npm run backfill                      # SQD_PORTAL_URL / SQD_PORTAL_API_KEY for another portal
-PORT=8100 npm run live                # then point a squid at http://localhost:8100
+WRITER_GRACE_MS=0 npm run live        # then point a squid at http://localhost:8100
 ```
 
 | Variable | Used by | Meaning |
@@ -88,7 +99,7 @@ PORT=8100 npm run live                # then point a squid at http://localhost:8
 | `LAKE_DEST` | all but `serve` | A local directory or `s3://bucket/prefix`; S3 credentials come from the AWS environment |
 | `LAKE_DIR` | `serve` | The local directory a lake was written to |
 | `STOP_BLOCK`, `FROM_BLOCK` | `discover`, `backfill`, `follow` | Bounds a run, for development and comparisons |
-| `SQD_PORTAL_URL`, `SQD_PORTAL_API_KEY` | `discover`, `backfill` | The SQD portal to read history from; the public one by default |
+| `SQD_PORTAL_URL`, `SQD_PORTAL_API_KEY` | `discover`, `backfill`, `live` | The SQD portal to read history from; the public one by default |
 | `RPC_URL_<DATASET>` | `live`, `follow`, the portal | JSON-RPC endpoint of a dataset, e.g. `RPC_URL_POLYGON_MAINNET`; `rpc.decentraland.org` by default |
 | `PORT` | `live`, `serve` | Portal port, 8100 by default |
 | `MAX_RANGE`, `ADDRESSES_PER_CALL` | `live`, `follow` | Blocks and addresses per `eth_getLogs` (2000 and 500) |
@@ -97,6 +108,7 @@ PORT=8100 npm run live                # then point a squid at http://localhost:8
 | `FLUSH_INTERVAL_MS` | `live` | Writes a chunk at least this often (30 minutes) |
 | `HOT_BLOCKS`, `HOT_POLL_MS` | `live` | `false` serves finalized blocks only; how often the chain head is polled (2000) |
 | `HOT_MAX_BLOCKS` | `live` | Unfinalized blocks held at most; a follower further behind serves finalized blocks only (1000) |
+| `WRITER_GRACE_MS` | `live` | How long to wait before writing, so a task being replaced stops first (120000; 0 for local runs) |
 | `DUCKDB_MEMORY_LIMIT` | `live`, `serve` | Memory the portal's queries may use, shared by every dataset (`1GB`) |
 
 ## Tests

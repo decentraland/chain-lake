@@ -1,7 +1,10 @@
+import { spawn } from 'child_process'
+import { join } from 'path'
 import { run } from '@subsquid/batch-processor'
 import { Database, Dest } from '@subsquid/file-store'
 import { createLogger } from '@subsquid/logger'
 import { datasetsFromEnv, loadConfig, required } from './config'
+import { BACKFILL_FILE, checkCoverage, coverageOf, PARTIAL_FILE } from './coverage'
 import { openDest } from './dest'
 import { Registry } from './discover'
 import { HotChain } from './live/hot'
@@ -37,6 +40,14 @@ async function main() {
       delete process.env[name]
     }
   }
+  // A deployment starts this task before it stops the one it replaces, and each dataset must have a
+  // single writer: nothing is written until the other task has had time to stop.
+  const grace = Number(process.env.WRITER_GRACE_MS ?? 120_000)
+  if (grace > 0) {
+    logger.info(`waiting ${grace / 1000} s for a task being replaced to stop writing`)
+    await new Promise((resolve) => setTimeout(resolve, grace))
+  }
+  await Promise.all(datasets.map((dataset) => bootstrap(lakeDest, dataset)))
   const views = new Map<string, LiveView>()
   for (const dataset of datasets) views.set(dataset, await follow(lakeDest, dataset))
 
@@ -45,6 +56,48 @@ async function main() {
     const view = views.get(dataset)
     return view && Promise.resolve(view)
   }).listen(port, () => logger.info(`serving ${[...views.keys()].join(', ')} on ${port}`))
+}
+
+/**
+ * A dataset whose backfill is not complete gets it first, from the SQD portal: `discover` when it
+ * has no contracts yet, then `backfill` up to the height they were discovered at. Both resume where
+ * an interrupted run stopped. Once the backfill is complete, the dataset is marked, and a restart
+ * never reads the SQD portal again.
+ */
+async function bootstrap(lakeDest: string, dataset: string): Promise<void> {
+  const log = logger.child(dataset)
+  const config = loadConfig(dataset)
+  const root = openDest(lakeDest, dataset)
+  if (await root.exists(PARTIAL_FILE)) {
+    throw new Error(`${dataset}: a development run wrote this lake with history left out (${PARTIAL_FILE}), so it is never served`)
+  }
+  if (await root.exists(BACKFILL_FILE)) return checkCoverage(config, JSON.parse(await root.readFile(BACKFILL_FILE)))
+  if (!(await root.exists('contracts.json'))) {
+    log.info('no lake yet: discovering the contracts the factories created, from the SQD portal')
+    await runScript('discover.js', dataset)
+  }
+  const registry = JSON.parse(await root.readFile('contracts.json')) as Registry
+  const chunks = openDest(lakeDest, dataset, 'chunks')
+  const written = async () => ((await chunks.exists(STATUS_FILE)) ? Number((await chunks.readFile(STATUS_FILE)).split('\n')[0]) : -1)
+  if ((await written()) < registry.height) {
+    log.info(`backfilling from the SQD portal: the lake is at block ${await written()}, contracts are known up to ${registry.height}`)
+    await runScript('backfill.js', dataset)
+  }
+  const reached = await written()
+  if (reached < registry.height) throw new Error(`${dataset}: the backfill ended at block ${reached}, short of ${registry.height}`)
+  await root.writeFile(BACKFILL_FILE, JSON.stringify(coverageOf(config, registry.height), null, 2) + '\n')
+  log.info(`backfill complete up to block ${registry.height}`)
+}
+
+/** Runs one of this package's commands for a dataset, in a process of its own: they exit when done. */
+function runScript(script: string, dataset: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // The bounds meant for development runs are left out: a backfill here always covers the whole dataset.
+    const { STOP_BLOCK, FROM_BLOCK, LAKE_ADDRESSES, ...env } = process.env
+    const child = spawn(process.execPath, [join(__dirname, script)], { env: { ...env, DATASET: dataset }, stdio: 'inherit' })
+    child.on('error', reject)
+    child.on('exit', (code, signal) => (code === 0 ? resolve() : reject(new Error(`${script} for ${dataset} ended with ${signal ?? `code ${code}`}`))))
+  })
 }
 
 /** Starts following one dataset, and returns what the portal serves of it. */

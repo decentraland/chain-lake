@@ -2,6 +2,7 @@ import { run } from '@subsquid/batch-processor'
 import { Database } from '@subsquid/file-store'
 import { createLogger } from '@subsquid/logger'
 import { blockFromEnv, loadConfig, required } from './config'
+import { markPartial } from './coverage'
 import { openDest } from './dest'
 import { Registry } from './discover'
 import { RpcClient } from './follow/rpc'
@@ -45,6 +46,7 @@ async function main() {
     if (from === undefined) throw new Error(`${config.dataset} has no lake to continue: run the backfill first, or set FROM_BLOCK`)
     const parent = await new RpcClient(rpcUrl(config.dataset)).call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])
     await chunks.writeFile('status.txt', `${from - 1}\n${parent.hash}`)
+    await markPartial(root, `a development lake started at block ${from}, without the history before it`)
     logger.info(`starting a new lake at block ${from}`)
   }
 
