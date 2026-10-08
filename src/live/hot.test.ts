@@ -58,7 +58,7 @@ class FakeChain {
       }
       if (c.method === 'eth_getTransactionByHash') {
         const [n, i] = (c.params[0] as string).slice(4).split('-').map(Number)
-        return { hash: c.params[0], from: '0xf', to: null, input: '0x', transactionIndex: hex(i), blockNumber: hex(n) }
+        return { hash: c.params[0], from: '0xf', to: null, input: '0x', transactionIndex: hex(i), blockNumber: hex(n), blockHash: this.blocks.get(n)!.hash }
       }
       throw new Error(`unexpected ${c.method}`)
     }
@@ -148,4 +148,47 @@ test('hot blocks are not served while the follower is far behind the head', asyn
   await hot.poll()
   assert.equal(hot.size, 0)
   assert.deepEqual(hot.head(), { number: 100, hash: '0xa100' })
+})
+
+test('a contract created in a hot block has its logs from that same block', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a', {
+    17: [
+      { address: FACTORY, topics: [PROXY_CREATED, '0x' + '0'.repeat(24) + CREATED.slice(2)] },
+      { address: CREATED, topics: [EVENT] },
+    ],
+  })
+  const { hot } = setup(chain, 15)
+  await hot.poll()
+  assert.deepEqual(hot.page(query, 16, 20)!.logs.map((l) => `${l.block_number}:${l.address.slice(0, 4)}`), ['17:0xfa', '17:0xc0'])
+})
+
+test('a reorg that does not make the chain longer is still noticed', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a')
+  const { hot } = setup(chain, 15)
+  await hot.poll()
+  assert.deepEqual(hot.head(), { number: 20, hash: '0xa20' })
+
+  // The head is replaced at the same height.
+  chain.reorg(20, 'b')
+  await hot.poll()
+  assert.deepEqual(hot.head(), { number: 20, hash: '0xb20' })
+
+  // And then by a shorter branch.
+  chain.reorg(19, 'c')
+  chain.latest = 19
+  await hot.poll()
+  assert.deepEqual(hot.head(), { number: 19, hash: '0xc19' })
+})
+
+test('hot blocks never answer for heights the follower has finalized', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a')
+  const { hot, base } = setup(chain, 15)
+  await hot.poll()
+  Object.assign(base, { height: 18, hash: '0xa18' })
+  assert.equal(hot.hashOf(17), undefined)
+  assert.equal(hot.hashOf(18), undefined)
+  assert.equal(hot.hashOf(19), '0xa19')
 })

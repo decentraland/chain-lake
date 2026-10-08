@@ -124,3 +124,23 @@ test('a request body too large is refused', async () => {
     assert.equal(res.status, 400)
   })
 })
+
+test('a parent block reorged away while the page was read is answered with a fork, not the page', async () => {
+  let checks = 0
+  const chain: ChainView = {
+    head: async () => ({ number: 100, hash: '0x100' }),
+    page: async (_q, _from, to) => emptyPage(to),
+    hot: {
+      head: () => ({ number: 110, hash: '0x110' }),
+      page: (_q, _from, to) => emptyPage(to),
+      // The parent is canonical when the request arrives, and replaced by the time the page is read.
+      hashAt: async () => (checks++ === 0 ? '0xparent' : '0xother'),
+      previousBlocks: async () => [{ number: 101, hash: '0xother' }],
+    },
+  }
+  await withPortal(chain, async (url) => {
+    const res = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 102, parentBlockHash: '0xparent' }) })
+    assert.equal(res.status, 409)
+    assert.deepEqual((await res.json()).previousBlocks, [{ number: 101, hash: '0xother' }])
+  })
+})

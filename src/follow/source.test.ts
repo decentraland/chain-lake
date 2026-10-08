@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { DatasetConfig } from '../config'
 import { Registry } from '../discover'
 import { RpcCall, RpcClient, RpcError } from './rpc'
-import { NodeBehind, rangeTooWide } from './fetch'
+import { ForkedLog, NodeBehind, rangeTooWide } from './fetch'
 import { RpcSource } from './source'
 
 const FACTORY = '0x' + 'fa'.repeat(20)
@@ -22,7 +22,7 @@ interface FakeLog {
 }
 
 /** A chain of a few blocks behind an RpcClient, with a provider limit on eth_getLogs ranges. */
-function fakeRpc(logs: FakeLog[], options: { maxRange?: number; corruptHashOf?: number; headAt?: number; error?: string } = {}) {
+function fakeRpc(logs: FakeLog[], options: { maxRange?: number; corruptHashOf?: number; headAt?: number; error?: string; movedTx?: string } = {}) {
   const calls: string[] = []
   const blockHash = (n: number) => `0xhash${n}`
   const answer = (c: RpcCall): unknown => {
@@ -33,7 +33,9 @@ function fakeRpc(logs: FakeLog[], options: { maxRange?: number; corruptHashOf?: 
     }
     if (c.method === 'eth_getTransactionByHash') {
       const log = logs.find((l) => l.tx === c.params[0])!
-      return { hash: log.tx, from: '0xfrom', to: log.address, input: '0x', transactionIndex: hex(0), blockNumber: hex(log.block) }
+      // A node answering across a reorg may place a transaction in another block, at another index.
+      if (log.tx === options.movedTx) return { hash: log.tx, from: '0xfrom', to: log.address, input: '0x', transactionIndex: hex(7), blockNumber: hex(log.block + 1), blockHash: blockHash(log.block + 1) }
+      return { hash: log.tx, from: '0xfrom', to: log.address, input: '0x', transactionIndex: hex(0), blockNumber: hex(log.block), blockHash: blockHash(log.block) }
     }
     if (c.method === 'eth_getLogs') {
       const f = c.params[0] as { address: string[]; topics?: string[][]; fromBlock: string; toBlock: string }
@@ -167,4 +169,9 @@ test('a failure that is not RPC trouble ends the stream instead of being retried
     for await (const _ of s.getFinalizedStream({ from: 10, to: 20 })) void _
   }, /AccessDenied/)
   assert.deepEqual(registry.contracts.map((c) => c.address), [STATIC], 'a contract is never followed before it is saved')
+})
+
+test('a transaction placed elsewhere than its log is refused', async () => {
+  const { client } = fakeRpc(chain, { movedTx: '0xt1' })
+  await assert.rejects(source(client).s.range(10, 20), ForkedLog)
 })

@@ -1,7 +1,7 @@
 import { createLogger } from '@subsquid/logger'
 import { DatasetConfig } from '../config'
 import { configuredContracts, Registry } from '../discover'
-import { createdContracts, fetchRange, ForkedLog, getHeaders, int, RpcBlock } from '../follow/fetch'
+import { fetchFollowing, ForkedLog, getHeaders, int, RpcBlock } from '../follow/fetch'
 import { RpcClient } from '../follow/rpc'
 import { BlockHeader } from '../serve/headers'
 import { Page } from '../serve/lake'
@@ -69,10 +69,13 @@ export class HotChain {
     return pageOf(this.blocks, query, from, to, headerOfBlock(upper))
   }
 
-  /** The hash this chain has at `number`, when it knows it. */
+  /**
+   * The hash this chain has at `number`, for blocks above the base only. At and below the base the
+   * finalized blocks decide: hot blocks kept from before the follower finalized past them may belong
+   * to a branch that lost.
+   */
   hashOf(number: number): string | undefined {
-    const b = this.base()
-    if (number === b.height) return b.hash
+    if (number <= this.base().height) return undefined
     return this.blocks.find((x) => x.header.number === number)?.header.hash
   }
 
@@ -82,7 +85,8 @@ export class HotChain {
     this.blocks = this.blocks.filter((b) => b.header.number > base.height)
     // Once finalized, the follower has added them to the registry.
     for (const [address, block] of this.created) if (block <= base.height) this.created.delete(address)
-    const latest = int((await this.rpc.call<RpcBlock>('eth_getBlockByNumber', ['latest', false])).number)
+    const head = await this.rpc.call<RpcBlock>('eth_getBlockByNumber', ['latest', false])
+    const latest = int(head.number)
     if (latest <= base.height) {
       this.blocks = []
       this.ready = true
@@ -98,6 +102,13 @@ export class HotChain {
     // The kept blocks must still hang from the base; otherwise start over from it.
     const first = this.blocks[0]
     if (first && first.header.parentHash !== base.hash && first.header.number === base.height + 1) this.blocks = []
+    // A head at or below the newest hot block must be one of them; a different hash there means a
+    // reorg that did not make the chain longer, and the hot blocks are rebuilt.
+    const known = this.blocks.find((b) => b.header.number === latest)
+    if (known && known.header.hash !== head.hash) {
+      logger.warn(`${this.config.dataset}: block ${latest} changed to ${head.hash}; rebuilding hot blocks from ${base.height + 1}`)
+      return this.rebuild(base, latest)
+    }
     const top = this.blocks[this.blocks.length - 1]
     const from = top ? top.header.number + 1 : base.height + 1
     if (from > latest) {
@@ -113,7 +124,14 @@ export class HotChain {
     }
     // A link broke: a reorg. Rebuild everything above the base.
     logger.warn(`${this.config.dataset}: reorg below block ${from}; rebuilding hot blocks from ${base.height + 1}`)
+    return this.rebuild(base, latest)
+  }
+
+  /** Every hot block again, from the base to `latest`. */
+  private async rebuild(base: HashAndHeight, latest: number): Promise<void> {
     this.created.clear()
+    this.blocks = []
+    this.ready = false
     const rebuilt = await this.fetch(base.height + 1, latest, { number: base.height, hash: base.hash })
     this.blocks = rebuilt ?? []
     this.ready = rebuilt !== undefined
@@ -131,14 +149,12 @@ export class HotChain {
     }
 
     const known = new Set([...configuredContracts(this.config), ...this.registry.contracts].map((c) => c.address))
-    for (const c of await createdContracts(this.rpc, this.config.factories, from, to, new Set([...known, ...this.created.keys()]))) {
-      this.created.set(c.address, c.createdAt!.block)
-    }
-    const addresses = [...new Set([...known, ...this.created.keys()])]
     try {
-      const blocks = await fetchRange(this.rpc, addresses, this.options.addressesPerCall, from, to, true)
+      const { blocks, created } = await fetchFollowing(this.rpc, new Set([...known, ...this.created.keys()]), this.config.factories, this.options.addressesPerCall, from, to, true)
       // The logs must belong to the headers just checked.
       for (const b of blocks) if (b.header.hash !== headers.get(b.header.number)!.hash) return undefined
+      // Contracts created in these blocks are followed from now on, once the blocks are accepted.
+      for (const c of created) if (!known.has(c.address)) this.created.set(c.address, c.createdAt!.block)
       return blocks
     } catch (e) {
       if (e instanceof ForkedLog) return undefined

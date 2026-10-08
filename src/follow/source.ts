@@ -2,7 +2,7 @@ import { createLogger } from '@subsquid/logger'
 import { DatasetConfig } from '../config'
 import { configuredContracts, Registry } from '../discover'
 import { LakeBlock } from '../write'
-import { createdContracts, fetchRange, RpcBlock } from './fetch'
+import { fetchFollowing, RpcBlock } from './fetch'
 import { RpcClient, RpcTrouble } from './rpc'
 
 const logger = createLogger('lake:follow')
@@ -66,26 +66,27 @@ export class RpcSource {
     }
   }
 
-  /** Every followed log in [from, to], their blocks and transactions, and always the header of `to`. */
+  /**
+   * Every followed log in [from, to], their blocks and transactions, and always the header of `to`.
+   * The contracts the factories created in the range are followed from their creating block, and
+   * saved to the registry before the blocks are handed over to be written, so none is ever followed
+   * without being on file. The registry is saved only when it grows: it is large, and a range is read
+   * every few seconds at the head. The height on file may then lag, which only means fewer blocks are
+   * known to hold no new contract.
+   */
   async range(from: number, to: number): Promise<LakeBlock[]> {
-    await this.discover(from, to)
     // The configured contracts and factories are always followed, even by an older registry.
-    const addresses = [...new Set([...configuredContracts(this.config), ...this.registry.contracts].map((c) => c.address))]
-    return fetchRange(this.rpc, addresses, this.options.addressesPerCall, from, to)
-  }
-
-  /** Adds the contracts the factories created in [from, to] to the registry. */
-  private async discover(from: number, to: number): Promise<void> {
-    const added = await createdContracts(this.rpc, this.config.factories, from, to, new Set(this.registry.contracts.map((c) => c.address)))
-    // Saved only when it grows: it is large, and a range is read every few seconds at the head. The
-    // height on file may then lag, which only means fewer blocks are known to hold no new contract.
-    // It is saved before the new contracts are used, so none is ever followed without being on file.
+    const followed = new Set([...configuredContracts(this.config), ...this.registry.contracts].map((c) => c.address))
+    const { blocks, created } = await fetchFollowing(this.rpc, followed, this.config.factories, this.options.addressesPerCall, from, to)
+    const known = new Set(this.registry.contracts.map((c) => c.address))
+    const added = created.filter((c) => !known.has(c.address))
     if (added.length) {
       await this.onRegistryChange({ ...this.registry, height: Math.max(this.registry.height, to), contracts: [...this.registry.contracts, ...added] })
       this.registry.contracts.push(...added)
       logger.info(`${this.config.dataset}: ${added.length} new contracts in blocks ${from}-${to}`)
     }
     this.registry.height = Math.max(this.registry.height, to)
+    return blocks
   }
 
   /**

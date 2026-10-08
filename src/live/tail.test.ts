@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { LakeDataset, Page } from '../serve/lake'
 import { parseQuery } from '../serve/query'
 import { LakeBlock } from '../write'
+import { HotChain } from './hot'
 import { matches, Tail } from './tail'
 import { LiveView } from './view'
 
@@ -63,4 +64,19 @@ test('a page never spans the lake files and the tail', async () => {
   assert.deepEqual(asked, [[10, 90], [90, 100]])
   assert.equal(fromTail.upper.number, 150)
   assert.deepEqual(await view.head(), { number: 150, hash: '0x150' })
+})
+
+test('the fork check trusts finalized blocks over hot ones kept from a branch that lost', async () => {
+  const lake = { dataset: 'polygon-mainnet' } as unknown as LakeDataset
+  const tail = new Tail({ height: 0, hash: '0x0' })
+  // Hot blocks A1-A3 were served; then the follower finalized B1 and B2, before the next hot poll.
+  const stale: Record<number, string> = { 1: '0xa1', 2: '0xa2', 3: '0xa3' }
+  const chain = { hashOf: (n: number) => stale[n] } as unknown as HotChain
+  const b = (number: number) => ({ ...block(number), header: { ...block(number).header, hash: `0xb${number}`, parentHash: `0xb${number - 1}` } })
+  tail.add([b(1), b(2)])
+  const view = new LiveView(lake, tail, chain)
+
+  assert.equal(await view.hot!.hashAt(1), '0xb1', 'a client that continues from A1 must be told it forked')
+  assert.equal(await view.hot!.hashAt(2), '0xb2')
+  assert.equal(await view.hot!.hashAt(3), '0xa3', 'above the finalized head, the hot blocks decide')
 })

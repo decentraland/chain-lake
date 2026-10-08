@@ -75,15 +75,19 @@ async function answer(view: (dataset: string) => Promise<ChainView | undefined> 
   const query = parseQuery(JSON.parse(await readBody(req)))
   const hot = endpoint === 'stream' ? chain.hot : undefined
 
-  if (hot && query.parentBlockHash && query.fromBlock > 0) {
-    const parent = query.fromBlock - 1
-    const canonical = await hot.hashAt(parent)
-    if (canonical !== undefined && canonical !== query.parentBlockHash) {
-      const previousBlocks = await hot.previousBlocks(parent)
-      const finalized = await chain.head()
-      return send(res, 409, { previousBlocks }, headHeaders(finalized, latestOf(chain, finalized)))
-    }
+  // The client's parent block must be canonical, both before the page is read and once it is: the
+  // chain may reorganize meanwhile, and a page must never continue a branch that lost.
+  const forked = async () => {
+    if (!hot || !query.parentBlockHash || query.fromBlock === 0) return false
+    const canonical = await hot.hashAt(query.fromBlock - 1)
+    return canonical !== undefined && canonical !== query.parentBlockHash
   }
+  const answerFork = async () => {
+    const previousBlocks = await hot!.previousBlocks(query.fromBlock - 1)
+    const finalized = await chain.head()
+    return send(res, 409, { previousBlocks }, headHeaders(finalized, latestOf(chain, finalized)))
+  }
+  if (await forked()) return answerFork()
 
   // The heads are read after every wait above: the follower keeps moving meanwhile.
   let finalized = await chain.head()
@@ -100,6 +104,7 @@ async function answer(view: (dataset: string) => Promise<ChainView | undefined> 
     finalized = await chain.head()
     page = await chain.page(query, query.fromBlock, Math.min(to, finalized.number))
   }
+  if (await forked()) return answerFork()
   res.writeHead(200, { 'content-type': 'application/x-ndjson', ...headHeaders(finalized, latest) })
   for (const line of blockLines(query, page.upper, page.headers, page.logs, page.transactions)) res.write(line + '\n')
   res.end()

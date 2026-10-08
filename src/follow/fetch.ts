@@ -29,6 +29,7 @@ export interface RpcTransaction {
   input: string
   transactionIndex: string
   blockNumber: string
+  blockHash: string | null
 }
 
 export const hex = (n: number) => '0x' + n.toString(16)
@@ -73,22 +74,21 @@ export async function followedLogs(rpc: RpcClient, addresses: string[], perCall:
   return logs.filter((l) => !l.removed)
 }
 
-/** The contracts the factories created in [from, to], in chain order, skipping known ones. */
-export async function createdContracts(rpc: RpcClient, factories: Factory[], from: number, to: number, known: Set<string>): Promise<RegisteredContract[]> {
-  const active = factories.filter((f) => f.fromBlock <= to)
-  if (active.length === 0) return []
-  const logs = await getLogs(rpc, { address: active.map((f) => f.address), topics: [[...new Set(active.map((f) => f.topic0))]] }, from, to)
-  const added: RegisteredContract[] = []
-  const seen = new Set(known)
-  for (const log of logs.filter((l) => !l.removed).sort((a, b) => int(a.blockNumber) - int(b.blockNumber) || int(a.logIndex) - int(b.logIndex))) {
-    const factory = active.find((f) => f.address === log.address.toLowerCase() && f.topic0 === log.topics[0])
-    if (!factory) continue
-    const address = createdAddress(log.topics, factory.addressTopic)
-    if (seen.has(address)) continue
-    seen.add(address)
-    added.push({ name: 'collection', address, factory: factory.name, createdAt: { block: int(log.blockNumber), logIndex: int(log.logIndex), transactionHash: log.transactionHash } })
+/** The contracts the factories created in these blocks, in chain order, from the factory logs they hold. */
+export function createdIn(blocks: LakeBlock[], factories: Factory[]): RegisteredContract[] {
+  const created: RegisteredContract[] = []
+  const seen = new Set<string>()
+  for (const block of blocks) {
+    for (const log of block.logs) {
+      const factory = factories.find((f) => f.address === log.address && f.topic0 === log.topics[0] && f.fromBlock <= block.header.number)
+      if (!factory) continue
+      const address = createdAddress(log.topics, factory.addressTopic)
+      if (seen.has(address)) continue
+      seen.add(address)
+      created.push({ name: 'collection', address, factory: factory.name, createdAt: { block: block.header.number, logIndex: log.logIndex, transactionHash: log.transactionHash } })
+    }
   }
-  return added
+  return created
 }
 
 export async function getHeaders(rpc: RpcClient, numbers: number[]): Promise<Map<number, RpcBlock>> {
@@ -113,7 +113,7 @@ export async function getTransactions(rpc: RpcClient, hashes: string[]): Promise
   return transactions
 }
 
-/** A log whose block hash differs from its header's: the node answered across a reorg. */
+/** A log or transaction placed elsewhere than its header says: the node answered across a reorg. */
 export class ForkedLog extends RpcTrouble {}
 
 /**
@@ -143,11 +143,42 @@ export function assemble(numbers: number[], headers: Map<number, RpcBlock>, logs
       seen.add(log.transactionHash)
       const t = transactions.get(log.transactionHash)
       if (!t) throw new RpcTrouble(`no transaction ${log.transactionHash}`)
+      // The transaction must sit where its log does: a node that answered across a reorg may place it
+      // in another block, or at another index, which the portal would then fail to match to the log.
+      if (t.hash !== log.transactionHash || t.blockHash !== block.header.hash || int(t.blockNumber) !== block.header.number || int(t.transactionIndex) !== log.transactionIndex) {
+        throw new ForkedLog(`transaction ${log.transactionHash} is at ${t.blockHash}:${t.transactionIndex}, its log at ${block.header.hash}:${log.transactionIndex}`)
+      }
       block.transactions.push({ transactionIndex: int(t.transactionIndex), hash: t.hash, from: t.from, to: t.to, input: t.input })
     }
     block.transactions.sort((a, b) => a.transactionIndex - b.transactionIndex)
   }
   return [...blocks.values()]
+}
+
+/**
+ * The blocks of [from, to] for the `followed` addresses and for every contract the factories create
+ * within the range. The new contracts are read from the factory logs of the fetched blocks themselves,
+ * so they come from the same checked chain as every other log; a fetch that shows a contract it did
+ * not follow is repeated with it, so its logs in the creating block are there too.
+ */
+export async function fetchFollowing(
+  rpc: RpcClient,
+  followed: Set<string>,
+  factories: Factory[],
+  perCall: number,
+  from: number,
+  to: number,
+  everyBlock = false
+): Promise<{ blocks: LakeBlock[]; created: RegisteredContract[] }> {
+  const addresses = new Set(followed)
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const blocks = await fetchRange(rpc, [...addresses], perCall, from, to, everyBlock)
+    const created = createdIn(blocks, factories)
+    const missing = created.filter((c) => !addresses.has(c.address))
+    if (missing.length === 0) return { blocks, created }
+    for (const c of missing) addresses.add(c.address)
+  }
+  throw new RpcTrouble(`blocks ${from}-${to} kept showing contracts their fetch did not follow`)
 }
 
 /** Logs, headers and transactions of [from, to] for `addresses`, with the header of `to` always present. */
