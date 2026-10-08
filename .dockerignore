@@ -1,0 +1,7 @@
+node_modules
+lib
+data
+.git
+*.log
+*.local.md
+notes/

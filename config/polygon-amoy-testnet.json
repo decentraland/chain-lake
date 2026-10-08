@@ -1,0 +1,82 @@
+{
+  "dataset": "polygon-amoy-testnet",
+  "fromBlock": 0,
+  "contracts": [
+    {
+      "name": "Marketplace",
+      "address": "0x2a09a000224f5dbe0e17214ca95cde506da7cb74"
+    },
+    {
+      "name": "MarketplaceV2",
+      "address": "0x0c8ad1f6aadf89d2eb19f01a100a6143108fe2b0"
+    },
+    {
+      "name": "BidV2",
+      "address": "0x4b66eab79cc03a96fb6275cfcdf23c0db431606d"
+    },
+    {
+      "name": "OldCommittee",
+      "address": "0x4bb5ace5ceb3dd51ea35fa01a8f9b5507c234270"
+    },
+    {
+      "name": "Committee",
+      "address": "0x53c9c388000b6fc91b91fb466742d0e869785c3b"
+    },
+    {
+      "name": "Rarity",
+      "address": "0xddb3781fff645325c8896aa1f067baa381607ecc"
+    },
+    {
+      "name": "RaritiesWithOracle",
+      "address": "0x25b6b4bac4adb582a0abd475439da6730777fbf7"
+    },
+    {
+      "name": "CollectionManager",
+      "address": "0x5309ae874fc4eb21adcd63f8b6c3f766cc3b1849"
+    },
+    {
+      "name": "OffChainMarketplaceV1",
+      "address": "0x6ab20ae56673ed65f520b7be332aeb61b3ed727d"
+    },
+    {
+      "name": "OffChainMarketplaceV2",
+      "address": "0x1b67d0e31eeb6b52d8eeed71d3616c2f5b33b8e7"
+    },
+    {
+      "name": "OffChainMarketplaceV3",
+      "address": "0x36fd1434a6c4b8ade80c9847c1d15033ce34488c"
+    },
+    {
+      "name": "CreditsManager",
+      "address": "0x8052a560e6e6ac86eeb7e711a4497f639b322fb3"
+    },
+    {
+      "name": "Spoke",
+      "address": "0xfe91aaa1012b47499cfe8758874f2d2c52b22cd8"
+    },
+    {
+      "name": "MANA",
+      "address": "0x7ad72b9f944ea9793cf4055d88f81138cc2c63a0"
+    },
+    {
+      "name": "ThirdPartyRegistry",
+      "address": "0x7d7c0b9d97385bada5fec6861e97d0df414af3c3"
+    }
+  ],
+  "factories": [
+    {
+      "name": "CollectionFactory",
+      "address": "0x2a72ec4241ac4fbc915ae98ac5a5b01ade721f4b",
+      "fromBlock": 5763249,
+      "topic0": "0xcfaab0d6675a72a93c114f48dd85add1076be0c88545968759ef034da7ad146f",
+      "addressTopic": 1
+    },
+    {
+      "name": "CollectionFactoryV3",
+      "address": "0x802de0c509add2ee29de24de7225daaff4741c43",
+      "fromBlock": 5763249,
+      "topic0": "0xcfaab0d6675a72a93c114f48dd85add1076be0c88545968759ef034da7ad146f",
+      "addressTopic": 1
+    }
+  ]
+}

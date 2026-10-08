@@ -1,0 +1,90 @@
+{
+  "dataset": "polygon-mainnet",
+  "fromBlock": 0,
+  "contracts": [
+    {
+      "name": "Marketplace",
+      "address": "0x02080031b45a3c67d338dd4a2cc309d28756a160"
+    },
+    {
+      "name": "MarketplaceV2",
+      "address": "0x480a0f4e360e8964e68858dd231c2922f1df45ef"
+    },
+    {
+      "name": "BidV2",
+      "address": "0xb96697fa4a3361ba35b774a42c58daccaad1b8e1"
+    },
+    {
+      "name": "OldCommittee",
+      "address": "0x71d9350ef44e1e451f00e447c0dff2d1fb75510a"
+    },
+    {
+      "name": "Committee",
+      "address": "0xaeec95a8aa671a6d3fec56594827d7804964fa70"
+    },
+    {
+      "name": "Rarity",
+      "address": "0x17113b44fdd661a156cc01b5031e3acf72c32eb3"
+    },
+    {
+      "name": "RaritiesWithOracle",
+      "address": "0xa9158e22f89bb3f69c5600338895cb5fb81e5090"
+    },
+    {
+      "name": "CollectionManager",
+      "address": "0x9d32aac179153a991e832550d9f96441ea27763a"
+    },
+    {
+      "name": "OffChainMarketplaceV1",
+      "address": "0x540fb08edb56aae562864b390542c97f562825ba"
+    },
+    {
+      "name": "OffChainMarketplaceV2",
+      "address": "0xa40b1d129b8906888720686f3a01921ddf37716f"
+    },
+    {
+      "name": "OffChainMarketplaceV3",
+      "address": "0xe38ef22abe871513555cba89adfe45ab4f548ada"
+    },
+    {
+      "name": "CreditsManager",
+      "address": "0xe9f961e6ded4e1476bbee4faab886d63a2493eb9"
+    },
+    {
+      "name": "CreditsManagerV2",
+      "address": "0x8b3a40ca1b6f5cafc99d112a4d02e897d1fd8cc5"
+    },
+    {
+      "name": "Spoke",
+      "address": "0xfe91aaa1012b47499cfe8758874f2d2c52b22cd8"
+    },
+    {
+      "name": "MANA",
+      "address": "0xa1c57f48f0deb89f569dfbe6e2b7f46d33606fd4"
+    },
+    {
+      "name": "AcrossSpokePool",
+      "address": "0x9295ee1d8c5b022be115a2ad3c30c72e34e7f096"
+    },
+    {
+      "name": "ThirdPartyRegistry",
+      "address": "0x1c436c1efb4608dffdc8bace99d2b03c314f3348"
+    }
+  ],
+  "factories": [
+    {
+      "name": "CollectionFactory",
+      "address": "0xb549b2442b2bd0a53795bc5cdcbfe0caf7aca9f8",
+      "fromBlock": 15202000,
+      "topic0": "0xcfaab0d6675a72a93c114f48dd85add1076be0c88545968759ef034da7ad146f",
+      "addressTopic": 1
+    },
+    {
+      "name": "CollectionFactoryV3",
+      "address": "0x3195e88ae10704b359764cb38e429d24f1c2f781",
+      "fromBlock": 28121692,
+      "topic0": "0xcfaab0d6675a72a93c114f48dd85add1076be0c88545968759ef034da7ad146f",
+      "addressTopic": 1
+    }
+  ]
+}
