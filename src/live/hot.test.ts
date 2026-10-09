@@ -192,3 +192,22 @@ test('hot blocks never answer for heights the follower has finalized', async () 
   assert.equal(hot.hashOf(18), undefined)
   assert.equal(hot.hashOf(19), '0xa19')
 })
+
+test('hot blocks that no longer hang from the finalized base are not served until the next poll', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a', { 18: [{ address: STATIC, topics: [EVENT] }] })
+  const { hot, base } = setup(chain, 15)
+  await hot.poll()
+
+  // The follower finalizes block 16 of another branch before the next hot poll.
+  chain.reorg(16, 'b')
+  Object.assign(base, { height: 16, hash: '0xb16' })
+  assert.deepEqual(hot.head(), { number: 16, hash: '0xb16' }, 'no hot head from the branch that lost')
+  assert.equal(hot.hashOf(17), undefined)
+  assert.equal(hot.page(query, 17, 20), undefined, 'a client continuing from B16 never gets A17-A20')
+  assert.equal(hot.size, 0)
+
+  await hot.poll()
+  assert.deepEqual(hot.head(), { number: 20, hash: '0xb20' })
+  assert.equal(hot.page(query, 17, 20)!.upper.hash, '0xb20')
+})

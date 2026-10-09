@@ -30,14 +30,16 @@ The followed contracts are the configured ones, the factories, and every contrac
 `contracts.json` records them.
 
 ```
-<lake>/<dataset>/contracts.json
-<lake>/<dataset>/backfill.json                            once the backfill is complete: the block it reached and the contracts it covered
-<lake>/<dataset>/partial.txt                              left by development runs that skip history
-<lake>/<dataset>/chunks/status.txt                        the last block written
-<lake>/<dataset>/chunks/<from>-<to>/blocks.parquet
-<lake>/<dataset>/chunks/<from>-<to>/logs.parquet
-<lake>/<dataset>/chunks/<from>-<to>/transactions.parquet
+<lake>/<dataset>/manifest.json                            the last block the lake holds, and the chunks that hold it
+<lake>/<dataset>/contracts.json                           the contracts followed
+<lake>/<dataset>/coverage.json                            whose history the lake holds, and whether its backfill is complete
+<lake>/<dataset>/chunks/<from>-<to>-<writer>/blocks.parquet
+<lake>/<dataset>/chunks/<from>-<to>-<writer>/logs.parquet
+<lake>/<dataset>/chunks/<from>-<to>-<writer>/transactions.parquet
 ```
+
+The lake is what `manifest.json` lists, and nothing else: a chunk folder it does not list is never
+read.
 
 Addresses and hashes are lowercase hex strings, so the files read the same in DuckDB, Athena or
 Spark.
@@ -55,18 +57,26 @@ Spark.
 A dataset starts with `discover` and `backfill`. From then on `live` keeps it up to date and serves
 it. `live` is the image's default command, and runs the first two on its own: a dataset whose
 backfill is not complete is discovered and backfilled from the SQD portal before it is followed, and
-an interrupted backfill resumes where it stopped. Once complete, the dataset is marked with
-`backfill.json`, and `live` never reads the SQD portal for it again.
+an interrupted backfill resumes where it stopped. Once complete, `coverage.json` says so, and `live`
+never reads the SQD portal for that dataset again.
 
-`live` refuses to serve a dataset whose lake is missing history:
+`live` refuses a lake whose history it cannot vouch for:
 
-- one that a development run wrote with `LAKE_ADDRESSES` or `FROM_BLOCK`, which leaves `partial.txt`;
-- one whose config gained a contract after its backfill, since the lake holds none of that contract's history.
+- one with no `coverage.json`, which these commands did not start;
+- one that a development run wrote with `LAKE_ADDRESSES` or `FROM_BLOCK`, which `coverage.json` marks as partial;
+- one whose config gained a contract after its backfill started, since the lake holds none of that contract's earlier history.
 
 One `live` process runs a follower per dataset and a single portal, so one service covers both
-chains of an environment: `DATASETS=ethereum-mainnet,polygon-mainnet`. Each dataset has a single
-writer, so a dataset is followed by one process at a time. A deployment usually starts the new task
-before it stops the old one, so `live` waits `WRITER_GRACE_MS` before it writes anything.
+chains of an environment: `DATASETS=ethereum-mainnet,polygon-mainnet`. The portal listens as soon as
+the process starts, serves each dataset once it is ready, and answers `503` for one still starting;
+`GET /health` reports which.
+
+Any number of processes may write the same lakes, during a deployment for instance, and the lakes
+stay consistent. Each process writes its chunks to folders of its own, and a chunk becomes part of
+the lake only when the process writes `manifest.json` by compare-and-swap (S3 conditional writes)
+from the version it last read. One process extends each lake; any other finds the manifest changed
+and stops before it publishes anything. `contracts.json` and `coverage.json` are written the same
+way.
 
 When a chain's RPC node fails or falls behind, only that dataset's follower stops, and it retries
 until the node answers again; the portal keeps serving everything it has. Any other failure ends the
@@ -89,7 +99,7 @@ npm run build
 export DATASET=polygon-mainnet LAKE_DEST=./data
 npm run discover                      # STOP_BLOCK=<block> to stop early
 npm run backfill                      # SQD_PORTAL_URL / SQD_PORTAL_API_KEY for another portal
-WRITER_GRACE_MS=0 npm run live        # then point a squid at http://localhost:8100
+npm run live                          # then point a squid at http://localhost:8100
 ```
 
 | Variable | Used by | Meaning |
@@ -108,7 +118,6 @@ WRITER_GRACE_MS=0 npm run live        # then point a squid at http://localhost:8
 | `FLUSH_INTERVAL_MS` | `live` | Writes a chunk at least this often (30 minutes) |
 | `HOT_BLOCKS`, `HOT_POLL_MS` | `live` | `false` serves finalized blocks only; how often the chain head is polled (2000) |
 | `HOT_MAX_BLOCKS` | `live` | Unfinalized blocks held at most; a follower further behind serves finalized blocks only (1000) |
-| `WRITER_GRACE_MS` | `live` | How long to wait before writing, so a task being replaced stops first (120000; 0 for local runs) |
 | `DUCKDB_MEMORY_LIMIT` | `live`, `serve` | Memory the portal's queries may use, shared by every dataset (`1GB`) |
 
 ## Tests

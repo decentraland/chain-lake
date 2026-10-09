@@ -16,6 +16,7 @@
     "live": "node lib/live.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1148.0",
     "@duckdb/node-api": "^1.5.6-r.1",
     "@subsquid/batch-processor": "^1.1.0",
     "@subsquid/evm-stream": "^0.1.5",

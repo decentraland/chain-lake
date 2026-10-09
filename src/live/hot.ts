@@ -44,26 +44,42 @@ export class HotChain {
   ) {}
 
   /**
+   * Whether the hot blocks above the base hang from it. The follower may finalize past some of them
+   * on another branch before the next poll; until that poll rebuilds them, none is served, since a
+   * client continuing from the finalized block must never be handed a block of the branch that lost.
+   * Checked on every read, so a poll that finishes after the base moved cannot publish stale blocks.
+   */
+  private anchored(): boolean {
+    if (!this.ready) return false
+    const b = this.base()
+    const next = this.blocks.find((x) => x.header.number === b.height + 1)
+    if (next) return next.header.parentHash === b.hash
+    // Nothing right above the base: the hot blocks are anchored only if none lies above it.
+    return !this.blocks.some((x) => x.header.number > b.height)
+  }
+
+  /**
    * The newest block known, or the finalized base while hot blocks are not served. Never below the
    * base: the follower may finalize past the newest hot block before the next poll.
    */
   head(): BlockRef {
-    const last = this.ready ? this.blocks[this.blocks.length - 1] : undefined
+    const last = this.anchored() ? this.blocks[this.blocks.length - 1] : undefined
     const b = this.base()
     if (last && last.header.number > b.height) return { number: last.header.number, hash: last.header.hash }
     return { number: b.height, hash: b.hash }
   }
 
   get size(): number {
-    return this.ready ? this.blocks.length : 0
+    return this.anchored() ? this.blocks.filter((x) => x.header.number > this.base().height).length : 0
   }
 
   /**
    * What the query asks for among hot blocks in [from, to], or undefined once `from` is no longer
-   * above the base: those blocks were finalized while the request waited, and are served as such.
+   * above the base (those blocks were finalized while the request waited, and are served as such) or
+   * the hot blocks no longer hang from the base.
    */
   page(query: EvmQuery, from: number, to: number): Page | undefined {
-    if (from <= this.base().height) return undefined
+    if (from <= this.base().height || !this.anchored()) return undefined
     const upper = this.blocks.find((b) => b.header.number === to)
     if (!upper) throw new Error(`block ${to} is not a hot block`)
     return pageOf(this.blocks, query, from, to, headerOfBlock(upper))
@@ -75,7 +91,7 @@ export class HotChain {
    * to a branch that lost.
    */
   hashOf(number: number): string | undefined {
-    if (number <= this.base().height) return undefined
+    if (number <= this.base().height || !this.anchored()) return undefined
     return this.blocks.find((x) => x.header.number === number)?.header.hash
   }
 

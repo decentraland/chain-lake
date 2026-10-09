@@ -1,14 +1,13 @@
 import { run } from '@subsquid/batch-processor'
 import { DataSourceBuilder } from '@subsquid/evm-stream'
-import { Database } from '@subsquid/file-store'
 import { createLogger } from '@subsquid/logger'
 import { blockFromEnv, loadConfig, required } from './config'
-import { markPartial } from './coverage'
-import { openDest } from './dest'
-import { configuredContracts, Registry } from './discover'
+import { checkCoverage, markPartial, readCoverage } from './coverage'
+import { configuredContracts, Registry, REGISTRY_FILE } from './discover'
 import { portalSource } from './portal'
-import { tables } from './tables'
+import { openStore } from './store'
 import { writeBlocks } from './write'
+import { openWriter } from './writer'
 
 const logger = createLogger('lake:backfill')
 
@@ -18,9 +17,10 @@ const ADDRESSES_PER_REQUEST = 1000
 async function main() {
   const config = loadConfig()
   const lakeDest = required('LAKE_DEST')
-  const registry = JSON.parse(
-    await openDest(lakeDest, config.dataset).readFile('contracts.json')
-  ) as Registry
+  const store = openStore(lakeDest, config.dataset)
+  const registry = (await store.read<Registry>(REGISTRY_FILE))?.value
+  const coverage = (await readCoverage(store))?.value
+  if (!registry || !coverage) throw new Error(`${config.dataset} has not been discovered: run discover on an empty location first`)
 
   // Never past the height the registry was discovered at: a contract created later would be
   // missing from the filter, and its logs silently absent.
@@ -33,7 +33,9 @@ async function main() {
   if (addresses.length === 0) throw new Error('no contracts to backfill')
   const from = blockFromEnv('FROM_BLOCK')
   if (only || from !== undefined) {
-    await markPartial(openDest(lakeDest, config.dataset), `a development backfill: LAKE_ADDRESSES=${only?.join(',') ?? ''} FROM_BLOCK=${from ?? ''}`)
+    await markPartial(store, config, `a development backfill (LAKE_ADDRESSES=${only?.join(',') ?? ''} FROM_BLOCK=${from ?? ''}) left history out`)
+  } else {
+    checkCoverage(config, coverage)
   }
 
   const builder = new DataSourceBuilder()
@@ -49,11 +51,7 @@ async function main() {
     builder.addLog({ where: { address: addresses.slice(i, i + ADDRESSES_PER_REQUEST) }, include: { transaction: true } })
   }
 
-  const db = new Database({
-    tables,
-    dest: openDest(lakeDest, config.dataset, 'chunks'),
-    chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
-  })
+  const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64) })
 
   logger.info(`backfilling ${addresses.length} contracts of ${config.dataset} up to block ${to}`)
   run(builder.build(), db, async (ctx) => {

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { AddressInfo } from 'net'
 import { Page } from './lake'
-import { blockLines, ChainView, createPortal } from './server'
+import { blockLines, ChainView, createPortal, NotReady } from './server'
 import { BadQuery, logCondition, parseQuery } from './query'
 
 const ADDRESS = '0x1c436c1efb4608dffdc8bace99d2b03c314f3348'
@@ -142,5 +142,46 @@ test('a parent block reorged away while the page was read is answered with a for
     const res = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 102, parentBlockHash: '0xparent' }) })
     assert.equal(res.status, 409)
     assert.deepEqual((await res.json()).previousBlocks, [{ number: 101, hash: '0xother' }])
+  })
+})
+
+test('a dataset that is not ready yet gets a 503, and the portal reports its health', async () => {
+  const server = createPortal(
+    (dataset) => {
+      if (dataset === 'polygon-mainnet') throw new NotReady('polygon-mainnet is starting')
+      return undefined
+    },
+    () => ({ 'polygon-mainnet': 'starting' })
+  )
+  await new Promise<void>((resolve) => server.listen(0, resolve))
+  try {
+    const url = `http://localhost:${(server.address() as AddressInfo).port}`
+    assert.equal((await fetch(`${url}/datasets/polygon-mainnet/finalized-head`)).status, 503)
+    assert.equal((await fetch(`${url}/datasets/ethereum-mainnet/finalized-head`)).status, 404)
+    const health = await fetch(`${url}/health`)
+    assert.equal(health.status, 200)
+    assert.deepEqual(await health.json(), { 'polygon-mainnet': 'starting' })
+  } finally {
+    server.close()
+  }
+})
+
+test('when the hot blocks are dropped while a request waits, it gets a 204, not a range below its start', async () => {
+  const asked: [number, number][] = []
+  const chain: ChainView = {
+    head: async () => ({ number: 100, hash: '0x100' }),
+    page: async (_q, from, to) => (asked.push([from, to]), emptyPage(to)),
+    hot: {
+      head: () => ({ number: 110, hash: '0x110' }),
+      // Reorged away from the finalized block: the next poll rebuilds them.
+      page: () => undefined,
+      hashAt: async () => undefined,
+      previousBlocks: async () => [],
+    },
+  }
+  await withPortal(chain, async (url) => {
+    const res = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 105 }) })
+    assert.equal(res.status, 204)
+    assert.deepEqual(asked, [])
   })
 })

@@ -40,9 +40,19 @@ export interface HotView {
  * view has them, and answers 409 with the canonical blocks when a client's parent block was
  * reorged away, as the SQD portal does.
  */
-export function createPortal(view: (dataset: string) => Promise<ChainView | undefined> | undefined) {
+/** A dataset the portal will serve but cannot yet: answered with a 503, which squids retry. */
+export class NotReady extends Error {}
+
+type Views = (dataset: string) => Promise<ChainView | undefined> | undefined
+
+/**
+ * `health`, when given, is served at `GET /health` (200, with what it returns): the portal is up and
+ * listening, whatever the state of each dataset.
+ */
+export function createPortal(view: Views, health?: () => Record<string, string>) {
   return createServer(async (req, res) => {
     try {
+      if (health && req.url === '/health') return send(res, 200, health())
       await answer(view, req, res)
     } catch (e) {
       if (res.headersSent) {
@@ -50,6 +60,7 @@ export function createPortal(view: (dataset: string) => Promise<ChainView | unde
         logger.error({ err: e }, 'request failed while answering')
         return res.destroy()
       }
+      if (e instanceof NotReady) return send(res, 503, { error: e.message })
       if (e instanceof BadQuery || e instanceof SyntaxError) return send(res, 400, { error: e.message })
       logger.error({ err: e }, 'request failed')
       send(res, 500, { error: 'internal error' })
@@ -57,7 +68,7 @@ export function createPortal(view: (dataset: string) => Promise<ChainView | unde
   })
 }
 
-async function answer(view: (dataset: string) => Promise<ChainView | undefined> | undefined, req: IncomingMessage, res: ServerResponse) {
+async function answer(view: Views, req: IncomingMessage, res: ServerResponse) {
   const match = req.url?.match(/^\/datasets\/([^/]+)\/(stream|finalized-stream|head|finalized-head)\/?$/)
   if (!match) return send(res, 404, { error: 'not found' })
   const [, name, endpoint] = match
@@ -100,9 +111,15 @@ async function answer(view: (dataset: string) => Promise<ChainView | undefined> 
 
   let page = hot && query.fromBlock > finalized.number ? hot.page(query, query.fromBlock, to) : undefined
   if (!page) {
-    // Finalized blocks, including hot ones finalized since the head was read.
+    // Finalized blocks, including hot ones finalized since the head was read. When the hot blocks
+    // were dropped instead (a reorg the next poll rebuilds), there may be nothing to serve yet.
     finalized = await chain.head()
-    page = await chain.page(query, query.fromBlock, Math.min(to, finalized.number))
+    const end = Math.min(to, finalized.number)
+    if (query.fromBlock > end) {
+      res.writeHead(204, headHeaders(finalized, latestOf(chain, finalized)))
+      return res.end()
+    }
+    page = await chain.page(query, query.fromBlock, end)
   }
   if (await forked()) return answerFork()
   res.writeHead(200, { 'content-type': 'application/x-ndjson', ...headHeaders(finalized, latest) })

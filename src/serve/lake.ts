@@ -1,6 +1,6 @@
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
-import { Dest } from '@subsquid/file-store'
-import { openDest } from '../dest'
+import { Chunk, Manifest, MANIFEST_FILE } from '../manifest'
+import { openStore, Store } from '../store'
 import { BlockHeader, headerFromRpc } from './headers'
 import { EvmQuery, logCondition } from './query'
 
@@ -42,12 +42,6 @@ function num(value: unknown): number {
   return typeof value === 'bigint' ? Number(value) : (value as number)
 }
 
-interface Chunk {
-  name: string
-  from: number
-  to: number
-}
-
 let instance: Promise<DuckDBInstance> | undefined
 let s3: Promise<void> | undefined
 
@@ -68,24 +62,23 @@ async function readFromS3(db: DuckDBConnection): Promise<void> {
   await db.run(`CREATE SECRET lake (TYPE s3, PROVIDER credential_chain${region ? `, REGION '${region}'` : ''})`)
 }
 
-const CHUNK_NAME = /^(\d{10})-(\d{10})$/
-/** How long the lake's status is trusted before it is read again. */
-const STATUS_TTL_MS = 5000
+/** A chunk folder as the writer names it: `<from>-<to>-<writer>`. */
+const CHUNK_DIR = /^\d{10}-\d{10}-[0-9a-f]+$/
+/** How long the manifest is trusted before it is read again. */
+const MANIFEST_TTL_MS = 5000
 
 /**
- * A dataset of the lake, `<lakeDest>/<dataset>/chunks/<from>-<to>/{blocks,logs,transactions}.parquet`,
- * in a local directory or an `s3://` location. Each query reads only the chunks whose block range
+ * A dataset of the lake, `<lakeDest>/<dataset>/`, in a local directory or an `s3://` location. It
+ * serves exactly the chunks its manifest lists, and each query reads only the ones whose block range
  * it touches.
  */
 export class LakeDataset {
-  private chunks: Chunk[] = []
-  private listedAt = -2
-  private status?: { height: number; hash: string; readAt: number }
+  private manifest?: Manifest & { readAt: number }
 
   private constructor(
     readonly dataset: string,
     private readonly base: string,
-    private readonly dest: Dest,
+    private readonly store: Store,
     private readonly db: DuckDBConnection
   ) {}
 
@@ -96,7 +89,7 @@ export class LakeDataset {
       s3 ??= readFromS3(db)
       await s3
     }
-    return new LakeDataset(dataset, base, openDest(lakeDest, dataset, 'chunks'), db)
+    return new LakeDataset(dataset, base, openStore(lakeDest, dataset), db)
   }
 
   private async rows<T>(sql: string): Promise<T[]> {
@@ -104,30 +97,33 @@ export class LakeDataset {
     return result.getRowObjects() as unknown as T[]
   }
 
-  /** The last block the lake's files hold, from the writer's status file. */
-  async written(): Promise<{ height: number; hash: string }> {
-    if (!this.status || Date.now() - this.status.readAt > STATUS_TTL_MS) {
-      const [h, hash] = (await this.dest.readFile('status.txt')).split('\n')
-      const height = Number(h)
-      // The status only grows. A read that started before the writer's last update, or that caught
-      // a write half done, must not take it back.
-      if (Number.isSafeInteger(height) && (!this.status || height >= this.status.height)) {
-        this.status = { height, hash, readAt: Date.now() }
-      } else if (this.status) {
-        this.status.readAt = Date.now()
-      } else {
-        throw new Error(`${this.dataset}: unreadable status "${h}"`)
-      }
+  /** What the lake holds, from its manifest. */
+  private async current(): Promise<Manifest> {
+    if (!this.manifest || Date.now() - this.manifest.readAt > MANIFEST_TTL_MS) {
+      const read = await this.store.read<Manifest>(MANIFEST_FILE)
+      if (!read) throw new Error(`${this.dataset}: the lake has no manifest yet`)
+      const bad = read.value.chunks.find((c) => !CHUNK_DIR.test(c.dir))
+      if (bad) throw new Error(`${this.dataset}: the manifest lists an invalid chunk folder "${bad.dir}"`)
+      // The lake only grows. A read that started before the writer's last commit must not take it back.
+      if (!this.manifest || read.value.height >= this.manifest.height) this.manifest = { ...read.value, readAt: Date.now() }
+      else this.manifest.readAt = Date.now()
     }
-    return { height: this.status.height, hash: this.status.hash }
+    return this.manifest
+  }
+
+  /** The last block the lake holds. */
+  async written(): Promise<{ height: number; hash: string }> {
+    const { height, hash } = await this.current()
+    return { height, hash }
   }
 
   /**
-   * What the writer just wrote, from the writer itself. The follower drops those blocks from memory
-   * at the same moment, so the new chunk has to be served at once, not after the status is read again.
+   * What the writer just committed, from the writer itself. The follower drops those blocks from
+   * memory at the same moment, so the new chunk has to be served at once, not after the manifest is
+   * read again.
    */
-  setWritten(state: { height: number; hash: string }): void {
-    this.status = { height: state.height, hash: state.hash, readAt: Date.now() }
+  setWritten(manifest: Manifest): void {
+    this.manifest = { ...manifest, readAt: Date.now() }
   }
 
   async head(): Promise<{ number: number; hash: string }> {
@@ -135,29 +131,13 @@ export class LakeDataset {
     return { number: height, hash }
   }
 
-  /** The chunks overlapping [from, to]; the listing is refreshed when the lake grows. */
+  /** The chunks overlapping [from, to]. */
   private async chunksIn(from: number, to: number): Promise<Chunk[]> {
-    const { height } = await this.written()
-    let chunks = this.chunks
-    if (height !== this.listedAt) {
-      chunks = (await this.dest.readdir('./'))
-        .map((name) => name.replace(/\/$/, '').match(CHUNK_NAME))
-        .filter((m): m is RegExpMatchArray => m !== null)
-        .map((m) => ({ name: m[0], from: Number(m[1]), to: Number(m[2]) }))
-        // A folder past the status is an unfinished write; the writer removes it on restart.
-        .filter((c) => c.to <= height)
-        .sort((a, b) => a.from - b.from)
-      // Listings of an older height that finish late answer their own request, but are not kept.
-      if (height > this.listedAt) {
-        this.chunks = chunks
-        this.listedAt = height
-      }
-    }
-    return chunks.filter((c) => c.to >= from && c.from <= to)
+    return (await this.current()).chunks.filter((c) => c.to >= from && c.from <= to)
   }
 
   private source(table: string, chunks: Chunk[]): string {
-    return `read_parquet([${chunks.map((c) => `'${this.base}/${c.name}/${table}.parquet'`).join(', ')}])`
+    return `read_parquet([${chunks.map((c) => `'${this.base}/${c.dir}/${table}.parquet'`).join(', ')}])`
   }
 
   async header(number: number): Promise<BlockHeader> {
