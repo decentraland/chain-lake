@@ -2,7 +2,7 @@ name: Build and publish
 on:
   release:
     types:
-      - created
+      - published
 jobs:
   build:
     name: "Build & publish: ${{github.ref_name}}"
