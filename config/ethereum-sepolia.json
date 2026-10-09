@@ -1,0 +1,55 @@
+{
+  "dataset": "ethereum-sepolia",
+  "fromBlock": 3831219,
+  "contracts": [
+    {
+      "name": "LANDRegistry",
+      "address": "0x42f4ba48791e2de32f5fbf553441c2672864bb33"
+    },
+    {
+      "name": "EstateRegistry",
+      "address": "0x369a7fbe718c870c79f99fb423882e8dd8b20486"
+    },
+    {
+      "name": "DCLRegistrar",
+      "address": "0x7518456ae93eb98f3e64571b689c626616bb7f30"
+    },
+    {
+      "name": "Marketplace",
+      "address": "0xccf0c17da6cd68041b1bf0f7e015767242077d8c"
+    },
+    {
+      "name": "ERC721Bid",
+      "address": "0x2c2835b95852fd975e087b3b25297322728792e2"
+    },
+    {
+      "name": "DCLControllerV2",
+      "address": "0xd2046364317c21fa8d121d84185c39e6e910cf89"
+    },
+    {
+      "name": "OffChainMarketplaceV1",
+      "address": "0x54bdd3ffc1448bdab0251f05dd554eec803adb2f"
+    },
+    {
+      "name": "OffChainMarketplaceV2",
+      "address": "0x1b67d0e31eeb6b52d8eeed71d3616c2f5b33b8e7"
+    },
+    {
+      "name": "OffChainMarketplaceV3",
+      "address": "0x257db44ac97789c16ab277eae87dcde0c246cc9f"
+    },
+    {
+      "name": "Spoke",
+      "address": "0xfe91aaa1012b47499cfe8758874f2d2c52b22cd8"
+    },
+    {
+      "name": "Rentals",
+      "address": "0xe70db6319e9cee3f604909bdade58d1f5c1cf702"
+    },
+    {
+      "name": "collection:ExclusiveMasksCollection",
+      "address": "0x11a970e744ff69db8f461c2d0fc91d4293914301"
+    }
+  ],
+  "factories": []
+}

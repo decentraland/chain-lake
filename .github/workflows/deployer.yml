@@ -1,0 +1,47 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment-environment:
+        required: true
+        type: choice
+        options:
+          - dev
+          - prd
+        default: dev
+        description: Environment
+      tag:
+        required: true
+        default: "latest"
+        type: string
+        description: "Docker tag (quay.io); prd needs an immutable version tag"
+
+jobs:
+  deployment:
+    if: ${{ inputs.deployment-environment }}
+    name: "Deploy to: ${{ inputs.deployment-environment }}"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.deployment-environment }}
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - name: Block mutable tags on prd
+        if: ${{ inputs.deployment-environment == 'prd' }}
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            latest|next|latest@*|next@*)
+              echo "::error::Refusing to deploy a mutable tag (latest/next) to prd. Pin an immutable version tag."
+              exit 1 ;;
+          esac
+      - name: Trigger deployment
+        id: deploy
+        uses: decentraland/actions/deploy-service@main
+        with:
+          docker-image: "quay.io/decentraland/chain-lake:${{ inputs.tag }}"
+          service-name: "chain-lake"
+          env: ${{ inputs.deployment-environment }}
+          token: ${{ secrets.GITHUB_TOKEN }}
