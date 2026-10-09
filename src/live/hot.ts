@@ -1,20 +1,17 @@
 import { createLogger } from '@subsquid/logger'
 import { DatasetConfig } from '../config'
-import { configuredContracts, Registry } from '../discover'
+import { followedAddresses, Registry } from '../discover'
 import { fetchFollowing, ForkedLog, getHeaders, int, RpcBlock } from '../follow/fetch'
 import { RpcClient } from '../follow/rpc'
-import { BlockHeader } from '../serve/headers'
 import { Page } from '../serve/lake'
 import { EvmQuery } from '../serve/query'
+import { BlockRef } from '../serve/server'
 import { LakeBlock } from '../write'
 import { headerOfBlock, HashAndHeight, pageOf } from './tail'
 
 const logger = createLogger('lake:hot')
-
-export interface BlockRef {
-  number: number
-  hash: string
-}
+/** How long an answer to "where did I fork" is reused. */
+const FORK_ANSWER_TTL_MS = 5000
 
 export interface HotOptions {
   addressesPerCall: number
@@ -164,7 +161,7 @@ export class HotChain {
       prev = { number: n, hash: h.hash }
     }
 
-    const known = new Set([...configuredContracts(this.config), ...this.registry.contracts].map((c) => c.address))
+    const known = new Set(followedAddresses(this.config, this.registry))
     try {
       const { blocks, created } = await fetchFollowing(this.rpc, new Set([...known, ...this.created.keys()]), this.config.factories, this.options.addressesPerCall, from, to, true)
       // The logs must belong to the headers just checked.
@@ -178,14 +175,20 @@ export class HotChain {
     }
   }
 
-  /** The canonical blocks below and at `number`, for a client to find where it forked. */
+  /**
+   * The canonical blocks below and at `number`, for a client to find where it forked. Answers are
+   * kept for a few seconds, so clients asking about the same fork share one set of RPC calls.
+   */
   async previousBlocks(number: number, count = 50): Promise<BlockRef[]> {
+    const kept = this.forks.get(number)
+    if (kept && Date.now() - kept.at < FORK_ANSWER_TTL_MS) return kept.blocks
     const numbers = Array.from({ length: count }, (_, i) => number - count + 1 + i).filter((n) => n >= 0)
     const headers = await getHeaders(this.rpc, numbers)
-    return numbers.map((n) => ({ number: n, hash: headers.get(n)!.hash }))
+    const blocks = numbers.map((n) => ({ number: n, hash: headers.get(n)!.hash }))
+    if (this.forks.size >= 100) this.forks.clear()
+    this.forks.set(number, { at: Date.now(), blocks })
+    return blocks
   }
+  private forks = new Map<number, { at: number; blocks: BlockRef[] }>()
 }
 
-export function toHeader(b: LakeBlock): BlockHeader {
-  return headerOfBlock(b)
-}

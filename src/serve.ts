@@ -17,7 +17,10 @@ createPortal((dataset) => {
   if (!views.has(dataset)) {
     // Only the datasets the lake holds, so a name that matches nothing opens nothing.
     if (!existsSync(join(lakeDir, dataset, MANIFEST_FILE))) return undefined
-    views.set(dataset, LakeDataset.open(lakeDir, dataset))
+    const opened = LakeDataset.open(lakeDir, dataset)
+    // A failed open is tried again by the next request, not answered with the same failure until restart.
+    opened.catch(() => views.delete(dataset))
+    views.set(dataset, opened)
   }
   return views.get(dataset)
 }).listen(port, () => logger.info(`portal listening on ${port}`))

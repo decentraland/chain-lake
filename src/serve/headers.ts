@@ -21,6 +21,9 @@ export function rpcUrl(dataset: string): string {
   return url
 }
 
+/** RPC trouble the portal cannot serve around right now: answered with a 503, which squids retry. */
+export class Upstream extends Error {}
+
 const cache = new Map<string, BlockHeader>()
 const MAX_CACHED = 10_000
 
@@ -38,8 +41,17 @@ export async function headerFromRpc(dataset: string, number: number): Promise<Bl
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getBlockByNumber', params: ['0x' + number.toString(16), false] }),
     signal: AbortSignal.timeout(30_000),
   })
-  const body = (await response.json()) as { result?: { number: string; hash: string; parentHash: string; timestamp: string } }
-  if (!response.ok || !body.result) throw new Error(`RPC has no block ${number} of ${dataset}`)
+  if (!response.ok) {
+    await response.body?.cancel()
+    throw new Upstream(`RPC answered ${response.status} for block ${number} of ${dataset}`)
+  }
+  let body: { result?: { number: string; hash: string; parentHash: string; timestamp: string } }
+  try {
+    body = await response.json()
+  } catch {
+    throw new Upstream(`RPC answered something other than JSON for block ${number} of ${dataset}`)
+  }
+  if (!body.result) throw new Upstream(`RPC has no block ${number} of ${dataset} yet`)
   const header = {
     number: parseInt(body.result.number, 16),
     hash: body.result.hash,

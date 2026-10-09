@@ -12,12 +12,23 @@ function header(block: LakeBlock): BlockHeader {
   return { number: block.header.number, hash: block.header.hash, parentHash: block.header.parentHash, timestamp: Math.floor(block.header.timestamp / 1000) }
 }
 
+/** Each request's lists as sets, built once per request: one lookup per list for each log. */
+const compiled = new WeakMap<LogRequest, (Set<string> | undefined)[]>()
+
+function setsOf(r: LogRequest): (Set<string> | undefined)[] {
+  let sets = compiled.get(r)
+  if (!sets) {
+    sets = [r.address, r.topic0, r.topic1, r.topic2, r.topic3].map((list) => list && new Set(list))
+    compiled.set(r, sets)
+  }
+  return sets
+}
+
 /** The same match as the SQL `logCondition`, for logs held in memory. */
 export function matches(r: LogRequest, log: { address: string; topics: string[] }): boolean {
-  const address = log.address.toLowerCase()
-  if (r.address && !r.address.includes(address)) return false
-  const topics = [r.topic0, r.topic1, r.topic2, r.topic3]
-  return topics.every((wanted, i) => !wanted || (log.topics[i] !== undefined && wanted.includes(log.topics[i].toLowerCase())))
+  const [address, ...topics] = setsOf(r)
+  if (address && !address.has(log.address.toLowerCase())) return false
+  return topics.every((wanted, i) => !wanted || (log.topics[i] !== undefined && wanted.has(log.topics[i].toLowerCase())))
 }
 
 /**

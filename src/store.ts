@@ -1,7 +1,7 @@
 import { createHash } from 'crypto'
 import { mkdir, readFile, rename, writeFile } from 'fs/promises'
 import { join } from 'path'
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 
 /** A file's content and the version it was read at. */
 export interface Versioned<T> {
@@ -19,6 +19,8 @@ export class Conflict extends Error {}
  */
 export interface Store {
   read<T>(name: string): Promise<Versioned<T> | undefined>
+  /** The file's version alone, cheaper than reading it. */
+  version(name: string): Promise<string | undefined>
   /** Writes `value` if the file is still at `version` (null: if it does not exist yet), and returns its new version. */
   write<T>(name: string, value: T, version: string | null): Promise<string>
 }
@@ -56,6 +58,15 @@ class S3Store implements Store {
     }
   }
 
+  async version(name: string): Promise<string | undefined> {
+    try {
+      return (await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: this.key(name) }))).ETag
+    } catch (e) {
+      if ((e as { name?: string }).name === 'NotFound') return undefined
+      throw e
+    }
+  }
+
   async write<T>(name: string, value: T, version: string | null): Promise<string> {
     try {
       const res = await this.client.send(
@@ -71,7 +82,12 @@ class S3Store implements Store {
     } catch (e) {
       const status = (e as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode
       // 412: the file changed, or exists; 409: another conditional write of it is in flight.
-      if (status === 412 || status === 409) throw new Conflict(`${name} was written by another process`)
+      if (status === 412 || status === 409) {
+        // The SDK retries a write whose answer was lost, and the retry finds the file it wrote.
+        const current = await this.read(name)
+        if (current && serialize(current.value) === serialize(value)) return current.version
+        throw new Conflict(`${name} was written by another process`)
+      }
       throw e
     }
   }
@@ -80,8 +96,8 @@ class S3Store implements Store {
 const digest = (text: string) => createHash('sha256').update(text).digest('hex')
 
 /**
- * A local directory, for development. The check and the write are not one atomic step, which is fine
- * for the single process a local lake has.
+ * A local directory, for development. The check and the write are not one atomic step, so a local
+ * lake is safe with one writer only; S3's conditional writes are what make concurrent writers safe.
  */
 class LocalStore implements Store {
   constructor(private readonly dir: string) {}
@@ -95,6 +111,10 @@ class LocalStore implements Store {
       throw e
     }
     return { value: JSON.parse(text) as T, version: digest(text) }
+  }
+
+  async version(name: string): Promise<string | undefined> {
+    return (await this.read(name))?.version
   }
 
   async write<T>(name: string, value: T, version: string | null): Promise<string> {

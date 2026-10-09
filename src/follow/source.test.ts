@@ -2,8 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatasetConfig } from '../config'
 import { Registry } from '../discover'
-import { RpcCall, RpcClient, RpcError } from './rpc'
-import { ForkedLog, NodeBehind, rangeTooWide } from './fetch'
+import { RpcCall, RpcClient, RpcError, RpcRejected } from './rpc'
+import { ForkedLog, getLogs, NodeBehind, rangeTooWide } from './fetch'
 import { RpcSource } from './source'
 
 const FACTORY = '0x' + 'fa'.repeat(20)
@@ -174,4 +174,17 @@ test('a failure that is not RPC trouble ends the stream instead of being retried
 test('a transaction placed elsewhere than its log is refused', async () => {
   const { client } = fakeRpc(chain, { movedTx: '0xt1' })
   await assert.rejects(source(client).s.range(10, 20), ForkedLog)
+})
+
+test('the header of the range end is asked before its logs, in the same batch', async () => {
+  const batches: string[][] = []
+  const { client } = fakeRpc(chain)
+  const recording = { ...client, call: client.call, batch: async (calls: RpcCall[]) => (batches.push(calls.map((c) => c.method)), client.batch(calls)) } as unknown as RpcClient
+  await getLogs(recording, { address: [STATIC] }, 10, 20)
+  assert.deepEqual(batches, [['eth_getBlockByNumber', 'eth_getLogs']])
+})
+
+test('a provider cap on addresses per call ends the run instead of splitting ranges forever', async () => {
+  const { client } = fakeRpc(chain, { error: 'too many addresses: the limit is 100' })
+  await assert.rejects(source(client).s.range(10, 20), RpcRejected)
 })

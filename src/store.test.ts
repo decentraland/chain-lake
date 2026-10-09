@@ -21,3 +21,16 @@ test('a write succeeds only from the version last read or written', async () => 
     rmSync(lakeDir, { recursive: true, force: true })
   }
 })
+
+test('on S3, a write whose answer was lost is recognised by its content, not taken for a conflict', async () => {
+  const store = openStore('s3://bucket/lake', 'polygon-mainnet')
+  const written = JSON.stringify({ n: 1 }, null, 2) + '\n'
+  ;(store as unknown as { client: { send(command: { constructor: { name: string } }): Promise<unknown> } }).client = {
+    async send(command) {
+      if (command.constructor.name === 'PutObjectCommand') throw Object.assign(new Error('precondition failed'), { $metadata: { httpStatusCode: 412 } })
+      return { ETag: '"v2"', Body: { transformToString: async () => written } }
+    },
+  }
+  assert.equal(await store.write('registry.json', { n: 1 }, '"v1"'), '"v2"', 'the file holds what this process wrote')
+  await assert.rejects(store.write('registry.json', { n: 2 }, '"v1"'), Conflict, 'it holds something else')
+})

@@ -27,7 +27,7 @@
     "@subsquid/util-internal-processor-tools": "^2.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.12.7",
+    "@types/node": "^22.20.5",
     "typescript": "~5.4.5"
   }
 }

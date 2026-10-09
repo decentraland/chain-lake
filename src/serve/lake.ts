@@ -50,7 +50,10 @@ let s3: Promise<void> | undefined
  * otherwise take most of the machine's memory for each instance.
  */
 function duckdb(): Promise<DuckDBInstance> {
-  instance ??= DuckDBInstance.create(':memory:', { memory_limit: process.env.DUCKDB_MEMORY_LIMIT || '1GB' })
+  instance ??= DuckDBInstance.create(':memory:', { memory_limit: process.env.DUCKDB_MEMORY_LIMIT || '1GB' }).catch((e) => {
+    instance = undefined
+    throw e
+  })
   return instance
 }
 
@@ -66,6 +69,8 @@ async function readFromS3(db: DuckDBConnection): Promise<void> {
 const CHUNK_DIR = /^\d{10}-\d{10}-[0-9a-f]+$/
 /** How long the manifest is trusted before it is read again. */
 const MANIFEST_TTL_MS = 5000
+/** A query running longer is interrupted, so one request cannot hold a dataset's connection. */
+const QUERY_TIMEOUT_MS = 30_000
 
 /**
  * A dataset of the lake, `<lakeDest>/<dataset>/`, in a local directory or an `s3://` location. It
@@ -86,15 +91,30 @@ export class LakeDataset {
     const db = await (await duckdb()).connect()
     const base = `${lakeDest.replace(/\/$/, '')}/${dataset}/chunks`
     if (base.startsWith('s3://')) {
-      s3 ??= readFromS3(db)
+      s3 ??= readFromS3(db).catch((e) => {
+        s3 = undefined
+        throw e
+      })
       await s3
     }
     return new LakeDataset(dataset, base, openStore(lakeDest, dataset), db)
   }
 
-  private async rows<T>(sql: string): Promise<T[]> {
-    const result = await this.db.runAndReadAll(sql)
-    return result.getRowObjects() as unknown as T[]
+  /** Queries run one at a time on the dataset's connection, so a timeout interrupts only its own. */
+  private queue: Promise<unknown> = Promise.resolve()
+
+  private rows<T>(sql: string): Promise<T[]> {
+    const run = async () => {
+      const timer = setTimeout(() => this.db.interrupt(), QUERY_TIMEOUT_MS)
+      try {
+        return (await this.db.runAndReadAll(sql)).getRowObjects() as unknown as T[]
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    const result = this.queue.then(run, run)
+    this.queue = result.catch(() => undefined)
+    return result
   }
 
   /** What the lake holds, from its manifest. */

@@ -2,6 +2,7 @@ import { DataSourceBuilder } from '@subsquid/evm-stream'
 import { createLogger } from '@subsquid/logger'
 import { blockFromEnv, Contract, DatasetConfig, loadConfig, required } from './config'
 import { COVERAGE_FILE, coverageOf, readCoverage } from './coverage'
+import { createdIn } from './follow/fetch'
 import { portalSource } from './portal'
 import { openStore, Store } from './store'
 
@@ -24,12 +25,7 @@ export interface Registry {
   contracts: RegisteredContract[]
 }
 
-/** The address a factory log announces, from the topic the factory puts it in. */
-export function createdAddress(topics: string[], addressTopic: number): string {
-  const topic = topics[addressTopic]
-  if (!topic || !/^0x[0-9a-fA-F]{64}$/.test(topic)) throw new Error(`topic ${addressTopic} is not an address word`)
-  return ('0x' + topic.slice(-40)).toLowerCase()
-}
+export { createdAddress } from './follow/fetch'
 
 /** The contracts a dataset follows before discovery: its configured contracts and its factories. */
 export function configuredContracts(config: DatasetConfig): RegisteredContract[] {
@@ -37,10 +33,14 @@ export function configuredContracts(config: DatasetConfig): RegisteredContract[]
   return [...config.contracts, ...config.factories].map((c) => ({ name: c.name, address: c.address }))
 }
 
+/** Every address the dataset follows: the configured contracts and factories, even if an older registry lacks them, and the registry's. */
+export function followedAddresses(config: DatasetConfig, registry: Registry): string[] {
+  return [...new Set([...configuredContracts(config), ...registry.contracts].map((c) => c.address))]
+}
+
 export async function discover(config: DatasetConfig, to: number): Promise<Registry> {
   const contracts: RegisteredContract[] = configuredContracts(config)
   if (config.factories.length > 0) {
-    const factories = new Map(config.factories.map((f) => [f.address, f]))
     const builder = new DataSourceBuilder()
       .setPortal(portalSource(config.dataset))
       .setFields({ log: { address: true, topics: true, transactionHash: true } })
@@ -49,18 +49,7 @@ export async function discover(config: DatasetConfig, to: number): Promise<Regis
     }
     const from = Math.min(...config.factories.map((f) => f.fromBlock))
     for await (const batch of builder.build().getFinalizedStream({ from, to })) {
-      for (const block of batch.blocks) {
-        for (const log of block.logs) {
-          const factory = factories.get(log.address.toLowerCase())
-          if (!factory || log.topics[0] !== factory.topic0) continue
-          contracts.push({
-            name: 'collection',
-            address: createdAddress(log.topics, factory.addressTopic),
-            factory: factory.name,
-            createdAt: { block: block.header.number, logIndex: log.logIndex, transactionHash: log.transactionHash },
-          })
-        }
-      }
+      contracts.push(...createdIn(batch.blocks, config.factories))
       const last = batch.blocks[batch.blocks.length - 1]
       if (last) logger.info(`scanned to block ${last.header.number}: ${contracts.length} contracts`)
     }

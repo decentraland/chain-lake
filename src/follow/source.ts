@@ -1,8 +1,8 @@
 import { createLogger } from '@subsquid/logger'
 import { DatasetConfig } from '../config'
-import { configuredContracts, Registry } from '../discover'
+import { followedAddresses, Registry } from '../discover'
 import { LakeBlock } from '../write'
-import { fetchFollowing, RpcBlock } from './fetch'
+import { fetchFollowing, int, NodeBehind, RpcBlock } from './fetch'
 import { RpcClient, RpcTrouble } from './rpc'
 
 const logger = createLogger('lake:follow')
@@ -17,8 +17,6 @@ export interface FollowOptions {
   /** Stop after this block instead of following the chain, for bounded runs and comparisons. */
   stopBlock?: number
 }
-
-const int = (h: string) => parseInt(h, 16)
 
 /**
  * Finalized blocks over RPC, in the lake's block shape, for every contract the registry follows.
@@ -36,7 +34,8 @@ export class RpcSource {
 
   async getFinalizedHead(): Promise<{ number: number; hash: string }> {
     return this.retrying('reading the finalized block', async () => {
-      const block = await this.rpc.call<RpcBlock>('eth_getBlockByNumber', ['finalized', false])
+      const block = await this.rpc.call<RpcBlock | null>('eth_getBlockByNumber', ['finalized', false])
+      if (!block) throw new NodeBehind('the node answering has no finalized block yet')
       return { number: int(block.number), hash: block.hash }
     })
   }
@@ -75,8 +74,7 @@ export class RpcSource {
    * known to hold no new contract.
    */
   async range(from: number, to: number): Promise<LakeBlock[]> {
-    // The configured contracts and factories are always followed, even by an older registry.
-    const followed = new Set([...configuredContracts(this.config), ...this.registry.contracts].map((c) => c.address))
+    const followed = new Set(followedAddresses(this.config, this.registry))
     const { blocks, created } = await fetchFollowing(this.rpc, followed, this.config.factories, this.options.addressesPerCall, from, to)
     const known = new Set(this.registry.contracts.map((c) => c.address))
     const added = created.filter((c) => !known.has(c.address))
