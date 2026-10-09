@@ -146,21 +146,24 @@ test('a parent block reorged away while the page was read is answered with a for
 })
 
 test('a dataset that is not ready yet gets a 503, and the portal reports its health', async () => {
+  let health = { ready: false, datasets: { 'polygon-mainnet': 'starting' } }
   const server = createPortal(
     (dataset) => {
       if (dataset === 'polygon-mainnet') throw new NotReady('polygon-mainnet is starting')
       return undefined
     },
-    () => ({ 'polygon-mainnet': 'starting' })
+    () => health
   )
   await new Promise<void>((resolve) => server.listen(0, resolve))
   try {
     const url = `http://localhost:${(server.address() as AddressInfo).port}`
     assert.equal((await fetch(`${url}/datasets/polygon-mainnet/finalized-head`)).status, 503)
     assert.equal((await fetch(`${url}/datasets/ethereum-mainnet/finalized-head`)).status, 404)
-    const health = await fetch(`${url}/health`)
-    assert.equal(health.status, 200)
-    assert.deepEqual(await health.json(), { 'polygon-mainnet': 'starting' })
+    const starting = await fetch(`${url}/health`)
+    assert.equal(starting.status, 503)
+    assert.deepEqual(await starting.json(), { 'polygon-mainnet': 'starting' })
+    health = { ready: true, datasets: { 'polygon-mainnet': 'backfilling' } }
+    assert.equal((await fetch(`${url}/health`)).status, 200)
   } finally {
     server.close()
   }

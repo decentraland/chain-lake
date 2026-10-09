@@ -68,8 +68,10 @@ never reads the SQD portal for that dataset again.
 
 One `live` process runs a follower per dataset and a single portal, so one service covers both
 chains of an environment: `DATASETS=ethereum-mainnet,polygon-mainnet`. The portal listens as soon as
-the process starts, serves each dataset once it is ready, and answers `503` for one still starting;
-`GET /health` reports which.
+the process starts, serves each dataset once it is ready, and answers `503` for one still starting.
+`GET /health` reports each dataset's state, and answers `503` while a dataset that was already
+complete is not served yet, so a deployment keeps the task it replaces until then. A first
+backfill does not hold it back.
 
 Any number of processes may write the same lakes, during a deployment for instance, and the lakes
 stay consistent. Each process writes its chunks to folders of its own, and a chunk becomes part of

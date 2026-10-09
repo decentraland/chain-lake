@@ -4,6 +4,7 @@ import { run } from '@subsquid/batch-processor'
 import { createLogger } from '@subsquid/logger'
 import { datasetsFromEnv, loadConfig, required } from './config'
 import { bootstrap } from './bootstrap'
+import { readCoverage } from './coverage'
 import { openRegistry } from './discover'
 import { HotChain } from './live/hot'
 import { Tail } from './live/tail'
@@ -47,20 +48,27 @@ async function main() {
   }
 
   const views = new Map<string, LiveView>()
+  const states = new Map<string, DatasetState>(datasets.map((d) => [d, 'starting']))
   const port = Number(process.env.PORT || 8100)
   createPortal(
     (dataset) => {
       const view = views.get(dataset)
       if (view) return Promise.resolve(view)
-      if (datasets.includes(dataset)) throw new NotReady(`${dataset} is starting`)
+      if (datasets.includes(dataset)) throw new NotReady(`${dataset} is ${states.get(dataset)}`)
       return undefined
     },
-    () => Object.fromEntries(datasets.map((d) => [d, views.has(d) ? 'ready' : 'starting']))
+    // Ready once every dataset that was already complete is served again, so a deployment keeps the
+    // task it replaces until then. A first backfill takes hours and does not hold the task back: the
+    // portal had nothing to serve for that dataset before either.
+    () => ({ ready: ![...states.values()].includes('starting'), datasets: Object.fromEntries(states) })
   ).listen(port, () => logger.info(`portal listening on ${port} for ${datasets.join(', ')}`))
 
   for (const dataset of datasets) {
-    start(lakeDest, dataset).then(
-      (view) => views.set(dataset, view),
+    start(lakeDest, dataset, (state) => states.set(dataset, state)).then(
+      (view) => {
+        views.set(dataset, view)
+        states.set(dataset, 'ready')
+      },
       (e) => {
         logger.fatal(e)
         process.exit(1)
@@ -69,6 +77,9 @@ async function main() {
   }
 }
 
+/** `starting`: complete, and about to be served; `backfilling`: filling up from the SQD portal. */
+type DatasetState = 'starting' | 'backfilling' | 'ready'
+
 /** The commands this process runs, stopped with it. */
 const children = new Set<ChildProcess>()
 process.on('SIGTERM', () => {
@@ -76,8 +87,9 @@ process.on('SIGTERM', () => {
   process.exit(143)
 })
 
-async function start(lakeDest: string, dataset: string): Promise<LiveView> {
+async function start(lakeDest: string, dataset: string, report: (state: DatasetState) => void): Promise<LiveView> {
   const store = openStore(lakeDest, dataset)
+  if (!(await readCoverage(store))?.value.complete) report('backfilling')
   await bootstrap(store, loadConfig(dataset), (script) => runScript(script, dataset), logger.child(dataset))
   return follow(lakeDest, store, dataset)
 }
@@ -102,12 +114,15 @@ function runScript(script: string, dataset: string): Promise<void> {
 async function follow(lakeDest: string, store: Store, dataset: string): Promise<LiveView> {
   const log = logger.child(dataset)
   const config = loadConfig(dataset)
-  const { registry, save } = await openRegistry(store)
   const rpc = new RpcClient(rpcUrl(dataset))
 
-  const manifest = (await store.read<Manifest>(MANIFEST_FILE))?.value
-  if (!manifest) throw new Error(`${dataset} has no lake to continue: run the backfill first`)
-  const tail = new Tail({ height: manifest.height, hash: manifest.hash })
+  // The lake's state first, then the registry: a contract is saved before any block that needs it is
+  // committed, so a registry read after the manifest holds every contract up to the manifest's block.
+  // The writer starts from exactly that manifest, or fails if another process moved it meanwhile.
+  const pinned = await store.read<Manifest>(MANIFEST_FILE)
+  if (!pinned) throw new Error(`${dataset} has no lake to continue: run the backfill first`)
+  const { registry, save } = await openRegistry(store)
+  const tail = new Tail({ height: pinned.value.height, hash: pinned.value.hash })
   const lake = await LakeDataset.open(lakeDest, dataset)
 
   const source = new RpcSource(rpc, config, registry, save, {
@@ -120,6 +135,7 @@ async function follow(lakeDest: string, store: Store, dataset: string): Promise<
   // are already served from the new chunk.
   const db = openWriter(lakeDest, dataset, store, {
     chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
+    startAt: pinned.version,
     onCommit(committed) {
       lake.setWritten(committed)
       tail.written({ height: committed.height, hash: committed.hash })
