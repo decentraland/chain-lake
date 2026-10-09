@@ -71,3 +71,22 @@ test('two processes starting a new dataset at once: only one creates its lake', 
     rmSync(lakeDir, { recursive: true, force: true })
   }
 })
+
+test('a writer started from one manifest refuses to continue from a later one', async () => {
+  const lakeDir = mkdtempSync(join(tmpdir(), 'chain-lake-'))
+  try {
+    const store = openStore(lakeDir, DATASET)
+    const pinned = await store.write<Manifest>(MANIFEST_FILE, { height: 9, hash: '0x9', chunks: [] }, null)
+    // It read the registry alongside that manifest. Another process then saves a new contract and
+    // commits block 10 before this one connects: its registry may be missing that contract.
+    await store.write<Manifest>(MANIFEST_FILE, { height: 10, hash: '0x10', chunks: [] }, pinned)
+    const late = openWriter(lakeDir, DATASET, store, { chunkSizeMb: 64, startAt: pinned })
+    await assert.rejects(late.connect(), Conflict)
+
+    // Started from the current manifest, it connects.
+    const current = (await store.read<Manifest>(MANIFEST_FILE))!.version
+    await openWriter(lakeDir, DATASET, store, { chunkSizeMb: 64, startAt: current }).connect()
+  } finally {
+    rmSync(lakeDir, { recursive: true, force: true })
+  }
+})

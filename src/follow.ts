@@ -21,16 +21,7 @@ async function main() {
   const config = loadConfig()
   const lakeDest = required('LAKE_DEST')
   const store = openStore(lakeDest, config.dataset)
-  const { registry, save } = await openRegistry(store)
   const stop = blockFromEnv('STOP_BLOCK')
-
-  const source = new RpcSource(new RpcClient(rpcUrl(config.dataset)), config, registry, save, {
-    maxRange: Number(process.env.MAX_RANGE || 2000),
-    addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
-    pollMs: Number(process.env.POLL_MS || 5000),
-    // STOP_BLOCK bounds a run, for comparisons; without it the follower keeps up with the chain.
-    stopBlock: stop,
-  })
 
   // The follower continues a lake; on an empty one it would start from block 0 over RPC. It needs
   // the backfill's manifest, or an explicit FROM_BLOCK to start a development lake.
@@ -43,7 +34,18 @@ async function main() {
     logger.info(`starting a new lake at block ${from}`)
   }
 
-  const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64) })
+  // The lake's state first, then the registry, as in live: the writer starts from exactly that state.
+  const pinned = (await store.read<Manifest>(MANIFEST_FILE))!
+  const { registry, save } = await openRegistry(store)
+  const source = new RpcSource(new RpcClient(rpcUrl(config.dataset)), config, registry, save, {
+    maxRange: Number(process.env.MAX_RANGE || 2000),
+    addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
+    pollMs: Number(process.env.POLL_MS || 5000),
+    // STOP_BLOCK bounds a run, for comparisons; without it the follower keeps up with the chain.
+    stopBlock: stop,
+  })
+
+  const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64), startAt: pinned.version })
 
   logger.info(`following ${config.dataset}: ${registry.contracts.length} contracts, registry at block ${registry.height}`)
   run(source as never, db, async (ctx) => {

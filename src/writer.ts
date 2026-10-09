@@ -18,8 +18,22 @@ const CHUNK_FOLDER = /^(\d+)-(\d+)$/
  * - Readers serve only the chunks the manifest lists, so a chunk left behind by a writer that failed,
  *   or that lost the manifest to another, is never read.
  */
-export function openWriter(lakeDest: string, dataset: string, store: Store, options: { chunkSizeMb: number; onCommit?: (manifest: Manifest) => void }) {
-  const writer = randomBytes(4).toString('hex')
+export function openWriter(
+  lakeDest: string,
+  dataset: string,
+  store: Store,
+  options: {
+    chunkSizeMb: number
+    /**
+     * The manifest version this process started from, read before anything that must be at least
+     * as recent (the registry of contracts). Connecting to any other version fails with a Conflict,
+     * so the process never continues a lake from a state newer than what it read alongside it.
+     */
+    startAt?: string
+    onCommit?: (manifest: Manifest) => void
+  }
+) {
+  const writer = randomBytes(16).toString('hex')
   const chunks = openDest(lakeDest, dataset, 'chunks')
   let manifest: Versioned<Manifest> | undefined
   let flushed: Chunk | undefined
@@ -53,6 +67,9 @@ export function openWriter(lakeDest: string, dataset: string, store: Store, opti
         // file-store reads the state before every batch: a manifest that changed since this process
         // wrote it means another process extends the lake, and this one stops before it writes more.
         if (manifest && read?.version !== manifest.version) throw new Conflict(`${dataset}: another process extended the lake`)
+        if (!manifest && options.startAt !== undefined && read?.version !== options.startAt) {
+          throw new Conflict(`${dataset}: another process extended the lake while this one started`)
+        }
         manifest = read
         return read && { height: read.value.height, hash: read.value.hash }
       },

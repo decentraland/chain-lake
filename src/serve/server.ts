@@ -45,14 +45,20 @@ export class NotReady extends Error {}
 
 type Views = (dataset: string) => Promise<ChainView | undefined> | undefined
 
-/**
- * `health`, when given, is served at `GET /health` (200, with what it returns): the portal is up and
- * listening, whatever the state of each dataset.
- */
-export function createPortal(view: Views, health?: () => Record<string, string>) {
+/** Whether the portal serves what it should, and the state of each dataset. */
+export interface Health {
+  ready: boolean
+  datasets: Record<string, string>
+}
+
+/** `health`, when given, is served at `GET /health`: 200 when ready, 503 otherwise, with each dataset's state. */
+export function createPortal(view: Views, health?: () => Health) {
   return createServer(async (req, res) => {
     try {
-      if (health && req.url === '/health') return send(res, 200, health())
+      if (health && req.url === '/health') {
+        const { ready, datasets } = health()
+        return send(res, ready ? 200 : 503, datasets)
+      }
       await answer(view, req, res)
     } catch (e) {
       if (res.headersSent) {
