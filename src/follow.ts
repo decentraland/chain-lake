@@ -28,9 +28,10 @@ async function main() {
   if (!(await store.read(MANIFEST_FILE))) {
     const from = blockFromEnv('FROM_BLOCK')
     if (from === undefined) throw new Error(`${config.dataset} has no lake to continue: run the backfill first, or set FROM_BLOCK`)
-    const parent = await new RpcClient(rpcUrl(config.dataset)).call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])
-    await markPartial(store, config, `a development lake started at block ${from} left out the history before it`)
-    await store.write<Manifest>(MANIFEST_FILE, { height: from - 1, hash: parent.hash, chunks: [] }, null)
+    // Block 0 has no parent: the lake starts empty, as file-store's own initial state does.
+    const parent = from === 0 ? '0x' : (await new RpcClient(rpcUrl(config.dataset)).call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])).hash
+    if (from > 0) await markPartial(store, config, `a development lake started at block ${from} left out the history before it`)
+    await store.write<Manifest>(MANIFEST_FILE, { height: from - 1, hash: parent, chunks: [] }, null)
     logger.info(`starting a new lake at block ${from}`)
   }
 
@@ -48,8 +49,8 @@ async function main() {
   const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64), startAt: pinned.version })
 
   logger.info(`following ${config.dataset}: ${registry.contracts.length} contracts, registry at block ${registry.height}`)
-  run(source as never, db, async (ctx) => {
-    writeBlocks(ctx.store, ctx.blocks as never)
+  run(source, db, async (ctx) => {
+    writeBlocks(ctx.store, ctx.blocks)
     const last = ctx.blocks[ctx.blocks.length - 1] as { header: { number: number } } | undefined
     if (stop !== undefined && last && last.header.number >= stop) ctx.store.setForceFlush(true)
   })

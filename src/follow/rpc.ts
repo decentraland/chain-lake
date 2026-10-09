@@ -14,6 +14,12 @@ export class RpcError extends RpcTrouble {
 /** The node could not be reached, or kept failing, through every retry of the client. */
 export class RpcUnavailable extends RpcTrouble {}
 
+/**
+ * The node refused the request itself: a bad key, a forbidden method, a batch too large. Asking
+ * again changes nothing, so it is not RPC trouble to wait out; it ends the run, with this message.
+ */
+export class RpcRejected extends Error {}
+
 export interface RpcCall {
   method: string
   params: unknown[]
@@ -55,9 +61,16 @@ export class RpcClient {
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await fetch(this.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body, signal: AbortSignal.timeout(TIMEOUT_MS) })
-        if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`)
-        const answers = (await res.json()) as { id: number; result?: T; error?: { code: number; message: string } }[]
-        if (!Array.isArray(answers)) throw new Error(`unexpected answer: ${JSON.stringify(answers).slice(0, 200)}`)
+        if (res.status === 429 || res.status >= 500) {
+          await res.body?.cancel()
+          throw new Error(`HTTP ${res.status}`)
+        }
+        if (!res.ok) throw new RpcRejected(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+        const answers = (await res.json()) as { id: number; result?: T; error?: { code: number; message: string } }[] | { error?: { message: string } }
+        if (!Array.isArray(answers)) {
+          if (answers?.error) throw new RpcRejected(`the node rejected a batch of ${calls.length} calls: ${answers.error.message}`)
+          throw new Error(`unexpected answer: ${JSON.stringify(answers).slice(0, 200)}`)
+        }
         const byId = new Map(answers.map((a) => [a.id, a]))
         return calls.map((_, id) => {
           const a = byId.get(id)
@@ -65,6 +78,7 @@ export class RpcClient {
           return a.error ? new RpcError(a.error.code, a.error.message) : (a.result as T)
         })
       } catch (e) {
+        if (e instanceof RpcRejected) throw e
         if (attempt >= RETRIES) throw new RpcUnavailable(`no answer after ${attempt + 1} attempts: ${e instanceof Error ? e.message : e}`)
         await wait(Math.min(30_000, 500 * 2 ** attempt))
       }

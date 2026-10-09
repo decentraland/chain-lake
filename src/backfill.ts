@@ -3,16 +3,13 @@ import { DataSourceBuilder } from '@subsquid/evm-stream'
 import { createLogger } from '@subsquid/logger'
 import { blockFromEnv, loadConfig, required } from './config'
 import { checkCoverage, markPartial, readCoverage } from './coverage'
-import { configuredContracts, Registry, REGISTRY_FILE } from './discover'
+import { followedAddresses, Registry, REGISTRY_FILE } from './discover'
 import { portalSource } from './portal'
 import { openStore } from './store'
 import { writeBlocks } from './write'
 import { openWriter } from './writer'
 
 const logger = createLogger('lake:backfill')
-
-/** Addresses per log request; the portal caps the size of one query, not the number of requests. */
-const ADDRESSES_PER_REQUEST = 1000
 
 async function main() {
   const config = loadConfig()
@@ -27,9 +24,7 @@ async function main() {
   const to = Math.min(blockFromEnv('STOP_BLOCK') ?? registry.height, registry.height)
   // LAKE_ADDRESSES narrows the run to a few contracts, for development.
   const only = process.env.LAKE_ADDRESSES?.toLowerCase().split(',').filter(Boolean)
-  // The configured contracts and factories are always followed, even by an older registry.
-  const followed = [...new Set([...configuredContracts(config), ...registry.contracts].map((c) => c.address))]
-  const addresses = followed.filter((a) => !only || only.includes(a))
+  const addresses = followedAddresses(config, registry).filter((a) => !only || only.includes(a))
   if (addresses.length === 0) throw new Error('no contracts to backfill')
   const from = blockFromEnv('FROM_BLOCK')
   if (only || from !== undefined) {
@@ -46,10 +41,9 @@ async function main() {
       log: { address: true, topics: true, data: true, transactionHash: true },
       transaction: { hash: true, from: true, to: true, input: true },
     })
-  // Every log of every followed contract, not only the topics the squids read today.
-  for (let i = 0; i < addresses.length; i += ADDRESSES_PER_REQUEST) {
-    builder.addLog({ where: { address: addresses.slice(i, i + ADDRESSES_PER_REQUEST) }, include: { transaction: true } })
-  }
+  // Every log of every followed contract, not only the topics the squids read today. It is one
+  // request with every address, a few hundred KB on Polygon, which the shared SQD portal accepts.
+  builder.addLog({ where: { address: addresses }, include: { transaction: true } })
 
   const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64) })
 

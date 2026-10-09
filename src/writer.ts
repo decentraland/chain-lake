@@ -43,9 +43,10 @@ export function openWriter(
     writeFile: (file, data) => chunks.writeFile(file, data),
     exists: (path) => chunks.exists(path),
     mkdir: (path) => chunks.mkdir(path),
-    readdir: (path) => chunks.readdir(path),
-    // Nothing is deleted: a folder the manifest does not list is never read, and it may be in use by
-    // the process writing it.
+    // file-store lists the folder only to delete unfinished chunks, and nothing is deleted here: a
+    // folder the manifest does not list is never read, and it may be in use by the process writing it.
+    // (On S3, listing a lake that has no chunk yet would fail.)
+    readdir: async () => [],
     rm: async () => {},
     async transact(folder, cb) {
       const range = folder.match(CHUNK_FOLDER)
@@ -63,11 +64,15 @@ export function openWriter(
     chunkSizeMb: options.chunkSizeMb,
     hooks: {
       async onStateRead() {
+        if (manifest) {
+          // file-store reads the state before every batch: a manifest that changed since this process
+          // wrote it means another process extends the lake, and this one stops before it writes more.
+          // Its version is enough to tell.
+          if ((await store.version(MANIFEST_FILE)) !== manifest.version) throw new Conflict(`${dataset}: another process extended the lake`)
+          return { height: manifest.value.height, hash: manifest.value.hash }
+        }
         const read = await store.read<Manifest>(MANIFEST_FILE)
-        // file-store reads the state before every batch: a manifest that changed since this process
-        // wrote it means another process extends the lake, and this one stops before it writes more.
-        if (manifest && read?.version !== manifest.version) throw new Conflict(`${dataset}: another process extended the lake`)
-        if (!manifest && options.startAt !== undefined && read?.version !== options.startAt) {
+        if (options.startAt !== undefined && read?.version !== options.startAt) {
           throw new Conflict(`${dataset}: another process extended the lake while this one started`)
         }
         manifest = read

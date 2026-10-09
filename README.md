@@ -73,8 +73,8 @@ the process starts, serves each dataset once it is ready, and answers `503` for 
 complete is not served yet, so a deployment keeps the task it replaces until then. A first
 backfill does not hold it back.
 
-Any number of processes may write the same lakes, during a deployment for instance, and the lakes
-stay consistent. Each process writes its chunks to folders of its own, and a chunk becomes part of
+On S3, any number of processes may write the same lakes, during a deployment for instance, and the
+lakes stay consistent. (A local lake is meant for one process: its compare-and-swap is not atomic.) Each process writes its chunks to folders of its own, and a chunk becomes part of
 the lake only when the process writes `manifest.json` by compare-and-swap (S3 conditional writes)
 from the version it last read. One process extends each lake; any other finds the manifest changed
 and stops before it publishes anything. `contracts.json` and `coverage.json` are written the same

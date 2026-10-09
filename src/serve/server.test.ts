@@ -2,8 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { AddressInfo } from 'net'
 import { Page } from './lake'
+import { Upstream } from './headers'
 import { blockLines, ChainView, createPortal, NotReady } from './server'
-import { BadQuery, logCondition, parseQuery } from './query'
+import { BadQuery, logCondition, MAX_LIST, MAX_LOG_REQUESTS, parseQuery } from './query'
 
 const ADDRESS = '0x1c436c1efb4608dffdc8bace99d2b03c314f3348'
 const TOPIC = '0x' + 'ab'.repeat(32)
@@ -29,6 +30,17 @@ test('what the lake cannot serve is rejected, not answered with less data', () =
   assert.throws(() => parseQuery({ ...base, fields: { block: { gasUsed: true } } }), BadQuery)
   assert.throws(() => parseQuery({ ...base, logs: [{ address: ['0x12'] }] }), BadQuery)
   assert.throws(() => parseQuery({ ...base, logs: [{ transactionTraces: true }] }), BadQuery)
+})
+
+test('a malformed or oversized query is a BadQuery, never a TypeError', () => {
+  for (const body of [null, [], 'x', 1]) assert.throws(() => parseQuery(body), BadQuery)
+  for (const logs of ['x', {}, [null], [1], [[]]]) assert.throws(() => parseQuery({ ...base, logs }), BadQuery)
+  assert.throws(() => parseQuery({ ...base, parentBlockHash: 12 }), BadQuery)
+  assert.throws(() => parseQuery({ ...base, parentBlockHash: '0x12' }), BadQuery)
+  assert.throws(() => parseQuery({ ...base, logs: Array.from({ length: MAX_LOG_REQUESTS + 1 }, () => ({})) }), /at most/)
+  const addresses = (n: number) => Array.from({ length: n }, (_, i) => '0x' + i.toString(16).padStart(40, '0'))
+  assert.throws(() => parseQuery({ ...base, logs: [{ address: addresses(MAX_LIST + 1) }] }), /at most/)
+  assert.throws(() => parseQuery({ ...base, logs: [{ address: addresses(MAX_LIST) }, { address: addresses(MAX_LIST) }, { address: addresses(1) }] }), /at most/)
 })
 
 test('an empty filter list matches nothing, a missing one matches everything', () => {
@@ -72,9 +84,10 @@ async function withPortal(chain: ChainView, f: (url: string) => Promise<void>) {
 }
 
 const header = (number: number) => ({ number, hash: `0x${number}`, parentHash: `0x${number - 1}`, timestamp: number })
+const PARENT = '0x' + 'ab'.repeat(32)
 const emptyPage = (to: number): Page => ({ upper: header(to), logs: [], transactions: [], headers: new Map() })
 
-test('a fork lookup that fails is a 500, and the portal keeps serving', async () => {
+test('a fork lookup that fails is a 503, and the portal keeps serving', async () => {
   const chain: ChainView = {
     head: async () => ({ number: 100, hash: '0x100' }),
     page: async (_q, _from, to) => emptyPage(to),
@@ -88,8 +101,8 @@ test('a fork lookup that fails is a 500, and the portal keeps serving', async ()
     },
   }
   await withPortal(chain, async (url) => {
-    const forked = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 103, parentBlockHash: '0xother' }) })
-    assert.equal(forked.status, 500)
+    const forked = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 103, parentBlockHash: '0x' + 'ee'.repeat(32) }) })
+    assert.equal(forked.status, 503)
     assert.equal((await fetch(`${url}/head`)).status, 200)
   })
 })
@@ -120,8 +133,8 @@ test('hot blocks finalized while a request waited are served as finalized ones',
 test('a request body too large is refused', async () => {
   const chain: ChainView = { head: async () => ({ number: 100, hash: '0x100' }), page: async (_q, _from, to) => emptyPage(to) }
   await withPortal(chain, async (url) => {
-    const res = await fetch(`${url}/finalized-stream`, { method: 'POST', body: 'x'.repeat(17 * 1024 * 1024) })
-    assert.equal(res.status, 400)
+    const res = await fetch(`${url}/finalized-stream`, { method: 'POST', body: 'x'.repeat(2 * 1024 * 1024) })
+    assert.equal(res.status, 413)
   })
 })
 
@@ -134,12 +147,12 @@ test('a parent block reorged away while the page was read is answered with a for
       head: () => ({ number: 110, hash: '0x110' }),
       page: (_q, _from, to) => emptyPage(to),
       // The parent is canonical when the request arrives, and replaced by the time the page is read.
-      hashAt: async () => (checks++ === 0 ? '0xparent' : '0xother'),
+      hashAt: async () => (checks++ === 0 ? PARENT : '0xother'),
       previousBlocks: async () => [{ number: 101, hash: '0xother' }],
     },
   }
   await withPortal(chain, async (url) => {
-    const res = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 102, parentBlockHash: '0xparent' }) })
+    const res = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 102, parentBlockHash: PARENT }) })
     assert.equal(res.status, 409)
     assert.deepEqual((await res.json()).previousBlocks, [{ number: 101, hash: '0xother' }])
   })
@@ -186,5 +199,36 @@ test('when the hot blocks are dropped while a request waits, it gets a 204, not 
     const res = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 105 }) })
     assert.equal(res.status, 204)
     assert.deepEqual(asked, [])
+  })
+})
+
+test('what the client sent wrong is a 400; what went wrong upstream is a 503, which squids retry', async () => {
+  const chain: ChainView = {
+    head: async () => ({ number: 100, hash: '0x100' }),
+    page: async () => {
+      throw new Upstream('RPC answered 502 for block 100')
+    },
+  }
+  await withPortal(chain, async (url) => {
+    assert.equal((await fetch(`${url}/finalized-stream`, { method: 'POST', body: '{not json' })).status, 400)
+    assert.equal((await fetch(`${url}/finalized-stream`, { method: 'POST', body: JSON.stringify({ ...base, logs: 'x' }) })).status, 400)
+    assert.equal((await fetch(`${url}/finalized-stream`, { method: 'POST', body: JSON.stringify(base) })).status, 503)
+  })
+})
+
+test('finalized-stream checks the parent block too', async () => {
+  const chain: ChainView = {
+    head: async () => ({ number: 100, hash: '0x100' }),
+    page: async (_q, _from, to) => emptyPage(to),
+    hot: {
+      head: () => ({ number: 100, hash: '0x100' }),
+      page: () => undefined,
+      hashAt: async () => '0x' + 'cc'.repeat(32),
+      previousBlocks: async () => [{ number: 50, hash: '0x' + 'cc'.repeat(32) }],
+    },
+  }
+  await withPortal(chain, async (url) => {
+    const res = await fetch(`${url}/finalized-stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 51, parentBlockHash: '0x' + 'dd'.repeat(32) }) })
+    assert.equal(res.status, 409)
   })
 })

@@ -1,7 +1,7 @@
 import { Factory } from '../config'
-import { createdAddress, RegisteredContract } from '../discover'
+import type { RegisteredContract } from '../discover'
 import { LakeBlock } from '../write'
-import { RpcClient, RpcError, RpcTrouble } from './rpc'
+import { RpcClient, RpcError, RpcRejected, RpcTrouble } from './rpc'
 
 export interface RpcLog {
   removed?: boolean
@@ -38,7 +38,13 @@ export const int = (h: string) => parseInt(h, 16)
 /** The answers of a provider that mean "ask for a smaller range"; a rate limit is not one of them. */
 export function rangeTooWide(e: RpcError): boolean {
   if (/rate limit|too many requests|throttl/i.test(e.message)) return false
+  if (tooManyAddresses(e)) return false
   return /range|too many|limit|exceed|response size|query returned more than/i.test(e.message)
+}
+
+/** A provider's cap on the addresses of one call: a setting to lower, not a range to split. */
+export function tooManyAddresses(e: RpcError): boolean {
+  return /address/i.test(e.message) && /too many|limit|exceed|maximum/i.test(e.message)
 }
 
 /** A node that has not reached the block a call asks about yet. */
@@ -47,16 +53,19 @@ export class NodeBehind extends RpcTrouble {}
 /**
  * eth_getLogs over [from, to], halving the range while the provider says it is too wide.
  *
- * The header of `to` is asked in the same batch. A node behind `to` may answer eth_getLogs with the
+ * The header of `to` is asked first, in the same batch. A node behind `to` may answer eth_getLogs with the
  * logs it has so far and no error, but it answers that header with null, so the range is refused
  * and asked again. This holds when a batch is answered by one node, as it is behind a load balancer.
  */
 export async function getLogs(rpc: RpcClient, filter: { address?: string[]; topics?: (string[] | null)[] }, from: number, to: number): Promise<RpcLog[]> {
-  const [logs, upper] = await rpc.batch<unknown>([
-    { method: 'eth_getLogs', params: [{ ...filter, fromBlock: hex(from), toBlock: hex(to) }] },
+  // The header first: a node answers a batch in order, so a node that has block `to` when it answers
+  // the header still has it when it answers the logs after it.
+  const [upper, logs] = await rpc.batch<unknown>([
     { method: 'eth_getBlockByNumber', params: [hex(to), false] },
+    { method: 'eth_getLogs', params: [{ ...filter, fromBlock: hex(from), toBlock: hex(to) }] },
   ])
   if (logs instanceof RpcError) {
+    if (tooManyAddresses(logs)) throw new RpcRejected(`the node takes fewer addresses per call than ${filter.address?.length}: lower ADDRESSES_PER_CALL (${logs.message})`)
     if (!rangeTooWide(logs) || from === to) throw logs
     const mid = Math.floor((from + to) / 2)
     return [...(await getLogs(rpc, filter, from, mid)), ...(await getLogs(rpc, filter, mid + 1, to))]
@@ -74,13 +83,28 @@ export async function followedLogs(rpc: RpcClient, addresses: string[], perCall:
   return logs.filter((l) => !l.removed)
 }
 
-/** The contracts the factories created in these blocks, in chain order, from the factory logs they hold. */
-export function createdIn(blocks: LakeBlock[], factories: Factory[]): RegisteredContract[] {
+/** The address a factory log announces, from the topic the factory puts it in. */
+export function createdAddress(topics: string[], addressTopic: number): string {
+  const topic = topics[addressTopic]
+  if (!topic || !/^0x[0-9a-fA-F]{64}$/.test(topic)) throw new Error(`topic ${addressTopic} is not an address word`)
+  return ('0x' + topic.slice(-40)).toLowerCase()
+}
+
+interface FactoryLogs {
+  header: { number: number }
+  logs: { address: string; topics: string[]; logIndex: number; transactionHash: string }[]
+}
+
+/**
+ * The contracts the factories created in these blocks, in chain order, from the factory logs they
+ * hold. Discovery over the SQD portal and the follower over RPC both read creations this way.
+ */
+export function createdIn(blocks: FactoryLogs[], factories: Factory[]): RegisteredContract[] {
   const created: RegisteredContract[] = []
   const seen = new Set<string>()
   for (const block of blocks) {
     for (const log of block.logs) {
-      const factory = factories.find((f) => f.address === log.address && f.topic0 === log.topics[0] && f.fromBlock <= block.header.number)
+      const factory = factories.find((f) => f.address === log.address.toLowerCase() && f.topic0 === log.topics[0] && f.fromBlock <= block.header.number)
       if (!factory) continue
       const address = createdAddress(log.topics, factory.addressTopic)
       if (seen.has(address)) continue

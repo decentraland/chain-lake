@@ -17,7 +17,7 @@ import { rpcUrl } from './serve/headers'
 import { LakeDataset } from './serve/lake'
 import { createPortal, NotReady } from './serve/server'
 import { openStore, Store } from './store'
-import { LakeBlock, writeBlocks } from './write'
+import { writeBlocks } from './write'
 import { openWriter } from './writer'
 
 const logger = createLogger('lake:live')
@@ -29,8 +29,8 @@ const logger = createLogger('lake:live')
  *
  * - The portal listens at once. A dataset is served as soon as it is ready, and until then its
  *   requests get a 503, which squids retry.
- * - Any number of processes may run against the same lakes, during a deployment for instance: the
- *   lake's files are written by compare-and-swap, so one process extends each lake and any other
+ * - On S3, any number of processes may run against the same lakes, during a deployment for instance:
+ *   the lake's files are written by compare-and-swap, so one process extends each lake and any other
  *   fails before it publishes anything.
  * - RPC trouble stalls only the dataset it hits: its follower retries until the node answers again,
  *   and the portal keeps serving what it has. Any other failure ends the process, so the service
@@ -146,8 +146,8 @@ async function follow(lakeDest: string, store: Store, dataset: string): Promise<
   // tail held in memory stays small.
   const flushEveryMs = Number(process.env.FLUSH_INTERVAL_MS || 30 * 60 * 1000)
   let lastFlush = Date.now()
-  run(source as never, db, async (ctx) => {
-    const blocks = ctx.blocks as unknown as LakeBlock[]
+  run(source, db, async (ctx) => {
+    const blocks = ctx.blocks
     writeBlocks(ctx.store, blocks)
     tail.add(blocks)
     if (Date.now() - lastFlush >= flushEveryMs) {

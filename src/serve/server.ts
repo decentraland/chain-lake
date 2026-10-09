@@ -67,9 +67,11 @@ export function createPortal(view: Views, health?: () => Health) {
         return res.destroy()
       }
       if (e instanceof NotReady) return send(res, 503, { error: e.message })
-      if (e instanceof BadQuery || e instanceof SyntaxError) return send(res, 400, { error: e.message })
+      if (e instanceof BadQuery) return send(res, 400, { error: e.message })
+      if (e instanceof TooLarge) return send(res, 413, { error: e.message }, { connection: 'close' })
+      // RPC or storage trouble, most likely passing: a 503, which squids retry, where a 500 stops them.
       logger.error({ err: e }, 'request failed')
-      send(res, 500, { error: 'internal error' })
+      send(res, 503, { error: 'temporarily unavailable' })
     }
   })
 }
@@ -89,18 +91,27 @@ async function answer(view: Views, req: IncomingMessage, res: ServerResponse) {
   }
   if (req.method !== 'POST') return send(res, 405, { error: 'use POST' })
 
-  const query = parseQuery(JSON.parse(await readBody(req)))
+  const text = await readBody(req)
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    throw new BadQuery('the request body is not JSON')
+  }
+  const query = parseQuery(body)
   const hot = endpoint === 'stream' ? chain.hot : undefined
 
   // The client's parent block must be canonical, both before the page is read and once it is: the
-  // chain may reorganize meanwhile, and a page must never continue a branch that lost.
+  // chain may reorganize meanwhile, and a page must never continue a branch that lost. Checked on
+  // `finalized-stream` too, against the finalized blocks.
+  const forks = chain.hot
   const forked = async () => {
-    if (!hot || !query.parentBlockHash || query.fromBlock === 0) return false
-    const canonical = await hot.hashAt(query.fromBlock - 1)
+    if (!forks || !query.parentBlockHash || query.fromBlock === 0) return false
+    const canonical = await forks.hashAt(query.fromBlock - 1)
     return canonical !== undefined && canonical !== query.parentBlockHash
   }
   const answerFork = async () => {
-    const previousBlocks = await hot!.previousBlocks(query.fromBlock - 1)
+    const previousBlocks = await forks!.previousBlocks(query.fromBlock - 1)
     const finalized = await chain.head()
     return send(res, 409, { previousBlocks }, headHeaders(finalized, latestOf(chain, finalized)))
   }
@@ -151,21 +162,27 @@ function send(res: ServerResponse, status: number, body: unknown, headers: Recor
   res.end(JSON.stringify(body))
 }
 
-/** Larger than any query the squids send: the longest, every collection of a chain, is a few hundred KB. */
-const MAX_BODY = 16 * 1024 * 1024
+/** Far larger than any query the squids send, which are a few KB. */
+const MAX_BODY = 1024 * 1024
+/** Past this, a body is not even read to its end: the connection is cut. */
+const MAX_DRAINED = 16 * MAX_BODY
 
+class TooLarge extends Error {}
+
+/**
+ * The request body, up to MAX_BODY bytes. A larger one is no longer kept: it is read to its end, so
+ * the client can receive the 413, unless it goes on past MAX_DRAINED, which cuts the connection.
+ */
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
-    let body = ''
-    let tooLarge = false
-    req.on('data', (chunk) => {
-      if (!tooLarge) body += chunk
-      if (body.length > MAX_BODY) {
-        tooLarge = true
-        body = ''
-      }
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size <= MAX_BODY) chunks.push(chunk)
+      else if (size > MAX_DRAINED) req.destroy()
     })
-    req.on('end', () => (tooLarge ? reject(new BadQuery(`the request body is larger than ${MAX_BODY} bytes`)) : resolve(body)))
+    req.on('end', () => (size > MAX_BODY ? reject(new TooLarge(`the request body is larger than ${MAX_BODY} bytes`)) : resolve(Buffer.concat(chunks).toString('utf8'))))
     req.on('error', reject)
   })
 }
