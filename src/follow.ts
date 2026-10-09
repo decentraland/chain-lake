@@ -1,15 +1,15 @@
 import { run } from '@subsquid/batch-processor'
-import { Database } from '@subsquid/file-store'
 import { createLogger } from '@subsquid/logger'
 import { blockFromEnv, loadConfig, required } from './config'
 import { markPartial } from './coverage'
-import { openDest } from './dest'
-import { Registry } from './discover'
+import { openRegistry } from './discover'
 import { RpcClient } from './follow/rpc'
 import { RpcSource } from './follow/source'
+import { Manifest, MANIFEST_FILE } from './manifest'
 import { rpcUrl } from './serve/headers'
-import { tables } from './tables'
+import { openStore } from './store'
 import { writeBlocks } from './write'
+import { openWriter } from './writer'
 
 const logger = createLogger('lake:follow')
 
@@ -20,41 +20,30 @@ const logger = createLogger('lake:follow')
 async function main() {
   const config = loadConfig()
   const lakeDest = required('LAKE_DEST')
-  const root = openDest(lakeDest, config.dataset)
-  const registry = JSON.parse(await root.readFile('contracts.json')) as Registry
+  const store = openStore(lakeDest, config.dataset)
+  const { registry, save } = await openRegistry(store)
   const stop = blockFromEnv('STOP_BLOCK')
 
-  const source = new RpcSource(
-    new RpcClient(rpcUrl(config.dataset)),
-    config,
-    registry,
-    (r) => root.writeFile('contracts.json', JSON.stringify(r, null, 2) + '\n'),
-    {
-      maxRange: Number(process.env.MAX_RANGE || 2000),
-      addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
-      pollMs: Number(process.env.POLL_MS || 5000),
-      // STOP_BLOCK bounds a run, for comparisons; without it the follower keeps up with the chain.
-      stopBlock: stop,
-    }
-  )
+  const source = new RpcSource(new RpcClient(rpcUrl(config.dataset)), config, registry, save, {
+    maxRange: Number(process.env.MAX_RANGE || 2000),
+    addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
+    pollMs: Number(process.env.POLL_MS || 5000),
+    // STOP_BLOCK bounds a run, for comparisons; without it the follower keeps up with the chain.
+    stopBlock: stop,
+  })
 
   // The follower continues a lake; on an empty one it would start from block 0 over RPC. It needs
-  // the backfill's status, or an explicit FROM_BLOCK to seed one.
-  const chunks = openDest(lakeDest, config.dataset, 'chunks')
-  if (!(await chunks.exists('status.txt'))) {
+  // the backfill's manifest, or an explicit FROM_BLOCK to start a development lake.
+  if (!(await store.read(MANIFEST_FILE))) {
     const from = blockFromEnv('FROM_BLOCK')
     if (from === undefined) throw new Error(`${config.dataset} has no lake to continue: run the backfill first, or set FROM_BLOCK`)
     const parent = await new RpcClient(rpcUrl(config.dataset)).call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])
-    await chunks.writeFile('status.txt', `${from - 1}\n${parent.hash}`)
-    await markPartial(root, `a development lake started at block ${from}, without the history before it`)
+    await markPartial(store, config, `a development lake started at block ${from} left out the history before it`)
+    await store.write<Manifest>(MANIFEST_FILE, { height: from - 1, hash: parent.hash, chunks: [] }, null)
     logger.info(`starting a new lake at block ${from}`)
   }
 
-  const db = new Database({
-    tables,
-    dest: openDest(lakeDest, config.dataset, 'chunks'),
-    chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
-  })
+  const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64) })
 
   logger.info(`following ${config.dataset}: ${registry.contracts.length} contracts, registry at block ${registry.height}`)
   run(source as never, db, async (ctx) => {

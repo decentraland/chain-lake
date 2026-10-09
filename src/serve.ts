@@ -2,6 +2,7 @@ import { existsSync } from 'fs'
 import { join } from 'path'
 import { createLogger } from '@subsquid/logger'
 import { required } from './config'
+import { MANIFEST_FILE } from './manifest'
 import { LakeDataset } from './serve/lake'
 import { ChainView, createPortal } from './serve/server'
 
@@ -15,7 +16,7 @@ const views = new Map<string, Promise<ChainView>>()
 createPortal((dataset) => {
   if (!views.has(dataset)) {
     // Only the datasets the lake holds, so a name that matches nothing opens nothing.
-    if (!existsSync(join(lakeDir, dataset, 'chunks', 'status.txt'))) return undefined
+    if (!existsSync(join(lakeDir, dataset, MANIFEST_FILE))) return undefined
     views.set(dataset, LakeDataset.open(lakeDir, dataset))
   }
   return views.get(dataset)
