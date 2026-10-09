@@ -111,9 +111,15 @@ async function answer(view: Views, req: IncomingMessage, res: ServerResponse) {
 
   let page = hot && query.fromBlock > finalized.number ? hot.page(query, query.fromBlock, to) : undefined
   if (!page) {
-    // Finalized blocks, including hot ones finalized since the head was read.
+    // Finalized blocks, including hot ones finalized since the head was read. When the hot blocks
+    // were dropped instead (a reorg the next poll rebuilds), there may be nothing to serve yet.
     finalized = await chain.head()
-    page = await chain.page(query, query.fromBlock, Math.min(to, finalized.number))
+    const end = Math.min(to, finalized.number)
+    if (query.fromBlock > end) {
+      res.writeHead(204, headHeaders(finalized, latestOf(chain, finalized)))
+      return res.end()
+    }
+    page = await chain.page(query, query.fromBlock, end)
   }
   if (await forked()) return answerFork()
   res.writeHead(200, { 'content-type': 'application/x-ndjson', ...headHeaders(finalized, latest) })

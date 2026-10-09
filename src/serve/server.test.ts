@@ -165,3 +165,23 @@ test('a dataset that is not ready yet gets a 503, and the portal reports its hea
     server.close()
   }
 })
+
+test('when the hot blocks are dropped while a request waits, it gets a 204, not a range below its start', async () => {
+  const asked: [number, number][] = []
+  const chain: ChainView = {
+    head: async () => ({ number: 100, hash: '0x100' }),
+    page: async (_q, from, to) => (asked.push([from, to]), emptyPage(to)),
+    hot: {
+      head: () => ({ number: 110, hash: '0x110' }),
+      // Reorged away from the finalized block: the next poll rebuilds them.
+      page: () => undefined,
+      hashAt: async () => undefined,
+      previousBlocks: async () => [],
+    },
+  }
+  await withPortal(chain, async (url) => {
+    const res = await fetch(`${url}/stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 105 }) })
+    assert.equal(res.status, 204)
+    assert.deepEqual(asked, [])
+  })
+})
