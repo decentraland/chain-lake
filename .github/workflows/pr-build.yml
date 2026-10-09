@@ -1,0 +1,19 @@
+name: Build PR Image
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build:
+    # Pull requests from forks get no secrets, so they could not push the image.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    name: "Build & publish: PR #${{ github.event.pull_request.number }}"
+    uses: decentraland/actions/.github/workflows/build-quay-main.yml@main
+    with:
+      service-name: chain-lake
+      docker-tag: "pr-${{ github.event.pull_request.number }}"
+    secrets:
+      QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+      QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+
