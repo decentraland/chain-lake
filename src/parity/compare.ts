@@ -34,12 +34,14 @@ export interface Tally {
 }
 
 /**
- * A value in one canonical form: keys sorted and numbers as decimal strings, since a bigint cannot be
- * written as JSON. Strings stay exactly as served, hex case included: a squid compares them as they
+ * A value in one canonical form: keys sorted, and numbers and strings tagged with their kind, so a
+ * number and a bigint compare equal (a bigint cannot be written as JSON) while a number served as a
+ * string does not. Strings stay exactly as served, hex case included: a squid compares them as they
  * come, so a portal that changed their case would change what it sees.
  */
 export function canonical(value: unknown): unknown {
-  if (typeof value === 'bigint' || typeof value === 'number') return String(value)
+  if (typeof value === 'bigint' || typeof value === 'number') return `n:${value}`
+  if (typeof value === 'string') return `s:${value}`
   if (Array.isArray(value)) return value.map(canonical)
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {}
@@ -77,6 +79,11 @@ export function compareBlock(left: StreamedBlock, right: StreamedBlock): Differe
   const transactions = itemDifference(block, 'transactions', left.transactions, right.transactions)
   if (transactions) differences.push(transactions)
   return differences
+}
+
+/** A block one side alone holds, as a sample: its header, its item counts and its first log. */
+function summary(block: StreamedBlock) {
+  return { header: block.header, logs: block.logs.length, transactions: block.transactions.length, firstLog: block.logs[0] }
 }
 
 /** The blocks of a stream of batches, in order. */
@@ -126,11 +133,11 @@ export async function compareStreams(
   while (!a.done || !b.done) {
     if (!a.done && (b.done || a.value.header.number < b.value.header.number)) {
       count(tally.left, a.value)
-      record([{ block: a.value.header.number, what: 'only-left', left: a.value }])
+      record([{ block: a.value.header.number, what: 'only-left', left: summary(a.value) }])
       a = await l.next()
     } else if (!b.done && (a.done || b.value.header.number < a.value.header.number)) {
       count(tally.right, b.value)
-      record([{ block: b.value.header.number, what: 'only-right', right: b.value }])
+      record([{ block: b.value.header.number, what: 'only-right', right: summary(b.value) }])
       b = await r.next()
     } else if (!a.done && !b.done) {
       count(tally.left, a.value)

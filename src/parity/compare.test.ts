@@ -14,9 +14,10 @@ async function* stream(...blocks: StreamedBlock[]): AsyncGenerator<StreamedBlock
   for (const b of blocks) yield b
 }
 
-test('canonical sorts keys and writes numbers as decimal strings, and keeps strings as served', () => {
-  assert.deepEqual(canonical({ b: '0xABcd', a: 7n, c: [12, 'Text'], d: undefined }), { a: '7', b: '0xABcd', c: ['12', 'Text'] })
-  assert.equal(JSON.stringify(canonical({ x: 1, y: 2 })), JSON.stringify(canonical({ y: 2n, x: '1' })))
+test('canonical sorts keys, tags numbers and strings with their kind, and keeps strings as served', () => {
+  assert.deepEqual(canonical({ b: '0xABcd', a: 7n, c: [12, 'Text'], d: undefined }), { a: 'n:7', b: 's:0xABcd', c: ['n:12', 's:Text'] })
+  assert.equal(JSON.stringify(canonical({ x: 1, y: 2 })), JSON.stringify(canonical({ y: 2n, x: 1n })))
+  assert.notEqual(JSON.stringify(canonical({ x: 1 })), JSON.stringify(canonical({ x: '1' })))
 })
 
 test('two copies of a block that differ only in key order and number encoding are the same block', () => {

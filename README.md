@@ -115,7 +115,7 @@ npm run live                          # then point a squid at http://localhost:8
 | `LAKE_DIR` | `serve` | The local directory a lake was written to |
 | `STOP_BLOCK`, `FROM_BLOCK` | `discover`, `backfill`, `follow`, `parity` | Bounds a run, for development and comparisons |
 | `SQD_PORTAL_URL`, `SQD_PORTAL_API_KEY` | `discover`, `backfill`, `live`, `parity` | The SQD portal to read history from; the public one by default |
-| `RPC_URL_<DATASET>` | `live`, `follow`, the portal | JSON-RPC endpoint of a dataset, e.g. `RPC_URL_POLYGON_MAINNET`; `rpc.decentraland.org` by default |
+| `RPC_URL_<DATASET>` | `live`, `follow`, `parity`, the portal | JSON-RPC endpoint of a dataset, e.g. `RPC_URL_POLYGON_MAINNET`; `rpc.decentraland.org` by default |
 | `PORT` | `live`, `serve` | Portal port, 8100 by default |
 | `MAX_RANGE`, `ADDRESSES_PER_CALL` | `live`, `follow` | Blocks and addresses per `eth_getLogs` (2000 and 500) |
 | `POLL_MS` | `live`, `follow` | How often a follower that is caught up looks for newly finalized blocks (5000) |

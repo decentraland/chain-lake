@@ -42,6 +42,14 @@ function readQuery(file: string): QuerySpec {
   const unknown = Object.keys(spec).filter((key) => key !== 'fields' && key !== 'logs')
   if (unknown.length) throw new Error(`${file}: only fields and logs can be compared, not ${unknown.join(', ')}`)
   if (!Array.isArray(spec.logs) || !spec.logs.length) throw new Error(`${file}: no log request to compare`)
+  // In DataSourceBuilder's terms: a request in the portal's own shape ({ address, topic0, ... }) would
+  // be read as no filter at all, every log of the chain.
+  for (const request of spec.logs) {
+    const keys = Object.keys(request).filter((key) => key !== 'where' && key !== 'include' && key !== 'range')
+    if (keys.length || typeof request.where !== 'object' || request.where === null) {
+      throw new Error(`${file}: each log request is { where, include, range }, with a where; got ${JSON.stringify(request).slice(0, 120)}`)
+    }
+  }
   return spec
 }
 
@@ -78,8 +86,10 @@ async function main() {
   let lakeUrl = `${lakePortalUrl}/datasets/${dataset}`
   let close = () => {}
   if (!lakePortalUrl) {
-    // Opened before serving, so a lake that cannot be read fails here, not as retried 503s.
+    // Opened and read once before serving, so a lake that cannot be read, or has no manifest, fails
+    // here rather than as 503s the client retries.
     const view = await LakeDataset.open(lakeDest!, dataset)
+    await view.written()
     const server = createPortal((name) => (name === dataset ? Promise.resolve(view) : undefined)).listen(0, '127.0.0.1')
     await new Promise((resolve) => server.once('listening', resolve))
     lakeUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/datasets/${dataset}`
