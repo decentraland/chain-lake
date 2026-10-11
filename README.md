@@ -53,6 +53,7 @@ Spark.
 | `live` | Follows each chain in `DATASETS` over RPC from where its lake ends, and serves them all from one portal |
 | `follow` | Follows one chain over RPC without serving |
 | `serve` | Serves a local lake as it is |
+| `parity` | Compares what a lake serves with what the SQD portal serves for the same query, block by block, and reports every difference; it only reads |
 
 A dataset starts with `discover` and `backfill`. From then on `live` keeps it up to date and serves
 it. `live` is the image's default command, and runs the first two on its own: a dataset whose
@@ -109,10 +110,12 @@ npm run live                          # then point a squid at http://localhost:8
 | `DATASET` | all | `ethereum-mainnet`, `polygon-mainnet`, `ethereum-sepolia` or `polygon-amoy-testnet` |
 | `DATASETS` | `live` | Several datasets, comma-separated; `live` takes `DATASET` when this is not set |
 | `LAKE_DEST` | all but `serve` | A local directory or `s3://bucket/prefix`; S3 credentials come from the AWS environment |
+| `LAKE_PORTAL_URL` | `parity` | A portal already serving the lake, instead of serving `LAKE_DEST` from inside the process |
+| `QUERY_FILE` | `parity` | A squid's query as JSON, `{ fields, logs: [{ where, include, range }] }`; by default, everything the lake holds. The default asks both portals for the contracts in the lake's own registry, so a contract discovery missed is missing on both sides and goes unnoticed: a squid's own query, with its own addresses, catches it |
 | `LAKE_DIR` | `serve` | The local directory a lake was written to |
-| `STOP_BLOCK`, `FROM_BLOCK` | `discover`, `backfill`, `follow` | Bounds a run, for development and comparisons |
-| `SQD_PORTAL_URL`, `SQD_PORTAL_API_KEY` | `discover`, `backfill`, `live` | The SQD portal to read history from; the public one by default |
-| `RPC_URL_<DATASET>` | `live`, `follow`, the portal | JSON-RPC endpoint of a dataset, e.g. `RPC_URL_POLYGON_MAINNET`; `rpc.decentraland.org` by default |
+| `STOP_BLOCK`, `FROM_BLOCK` | `discover`, `backfill`, `follow`, `parity` | Bounds a run, for development and comparisons |
+| `SQD_PORTAL_URL`, `SQD_PORTAL_API_KEY` | `discover`, `backfill`, `live`, `parity` | The SQD portal to read history from; the public one by default |
+| `RPC_URL_<DATASET>` | `live`, `follow`, `parity`, the portal | JSON-RPC endpoint of a dataset, e.g. `RPC_URL_POLYGON_MAINNET`; `rpc.decentraland.org` by default |
 | `PORT` | `live`, `serve` | Portal port, 8100 by default |
 | `MAX_RANGE`, `ADDRESSES_PER_CALL` | `live`, `follow` | Blocks and addresses per `eth_getLogs` (2000 and 500) |
 | `POLL_MS` | `live`, `follow` | How often a follower that is caught up looks for newly finalized blocks (5000) |
