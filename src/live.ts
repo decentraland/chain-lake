@@ -124,6 +124,8 @@ async function follow(lakeDest: string, store: Store, dataset: string): Promise<
   const { registry, save } = await openRegistry(store)
   const tail = new Tail({ height: pinned.value.height, hash: pinned.value.hash })
   const lake = await LakeDataset.open(lakeDest, dataset)
+  // A lake the portal cannot read would otherwise be served as a 503 on every request.
+  await lake.check()
 
   const source = new RpcSource(rpc, config, registry, save, {
     maxRange: Number(process.env.MAX_RANGE || 2000),

@@ -72,7 +72,9 @@ chains of an environment: `DATASETS=ethereum-mainnet,polygon-mainnet`. The porta
 the process starts, serves each dataset once it is ready, and answers `503` for one still starting.
 `GET /health` reports each dataset's state, and answers `503` while a dataset that was already
 complete is not served yet, so a deployment keeps the task it replaces until then. A first
-backfill does not hold it back.
+backfill does not hold it back. Before serving a dataset, `live` reads the last chunk of its lake the way
+the portal does, so a lake it cannot read (missing credentials or CA certificates) stops the process
+instead of answering `503` to every request.
 
 On S3, any number of processes may write the same lakes, during a deployment for instance, and the
 lakes stay consistent. (A local lake is meant for one process: its compare-and-swap is not atomic.) Each process writes its chunks to folders of its own, and a chunk becomes part of

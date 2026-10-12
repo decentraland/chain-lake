@@ -131,6 +131,15 @@ export class LakeDataset {
     return this.manifest
   }
 
+  /**
+   * Reads the last chunk the manifest lists, so a lake that cannot be read (no credentials, no CA
+   * certificates for S3's TLS) fails when its dataset starts rather than on every request.
+   */
+  async check(): Promise<void> {
+    const { chunks } = await this.current()
+    if (chunks.length) await this.rows(`SELECT number FROM ${this.source('blocks', chunks.slice(-1))} LIMIT 1`)
+  }
+
   /** The last block the lake holds. */
   async written(): Promise<{ height: number; hash: string }> {
     const { height, hash } = await this.current()

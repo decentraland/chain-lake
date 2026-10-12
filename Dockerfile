@@ -17,6 +17,10 @@ COPY --from=builder /lake/lib lib
 COPY config config
 COPY package.json ./
 
+# DuckDB reads the lake from S3 over TLS, and checks it with the system's CA certificates, which the slim
+# image leaves out (Node carries its own, so the follower and the writer never needed them).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
 USER node
 # The S3 extensions are installed at build time, so the portal does not download them at start.
 RUN node -e "require('@duckdb/node-api').DuckDBInstance.create(':memory:').then((i) => i.connect()).then((c) => c.run('INSTALL httpfs; INSTALL aws;'))"
