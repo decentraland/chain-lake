@@ -59,10 +59,12 @@ function duckdb(): Promise<DuckDBInstance> {
 
 /** Extensions and secrets belong to the instance, so they are set up once. */
 async function readFromS3(db: DuckDBConnection): Promise<void> {
-  // Credentials come from the usual AWS chain: the task role on ECS.
+  // Credentials come from the usual AWS chain: the task role on ECS. They expire every few hours, and
+  // DuckDB renews chain credentials on its own only for the sts and web_identity chains, so REFRESH
+  // auto renews them before S3 starts refusing them.
   await db.run('INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;')
   const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
-  await db.run(`CREATE SECRET lake (TYPE s3, PROVIDER credential_chain${region ? `, REGION '${region}'` : ''})`)
+  await db.run(`CREATE SECRET lake (TYPE s3, PROVIDER credential_chain, REFRESH auto${region ? `, REGION '${region}'` : ''})`)
 }
 
 /** A chunk folder as the writer names it: `<from>-<to>-<writer>`. */
