@@ -110,3 +110,19 @@ test('a block holding more logs than a page is served whole', async (t) => {
   assert.equal(page.logs.length, MAX_LOGS + 1)
   assert.equal(page.upper.number, 150)
 })
+
+test('check reads the last chunk, and fails on a lake that cannot be read', async (t) => {
+  const lakeDir = dataset(t)
+  mkdirSync(join(lakeDir, DATASET))
+  writeManifest(lakeDir, { height: 0, hash: '0x0', chunks: [] })
+  await (await LakeDataset.open(lakeDir, DATASET)).check()
+
+  const first = await writeChunk(lakeDir, 1, 100, 50)
+  writeManifest(lakeDir, { height: 100, hash: '0x100', chunks: [first] })
+  await (await LakeDataset.open(lakeDir, DATASET)).check()
+
+  // A chunk the manifest lists but that cannot be read, as S3 cannot without CA certificates.
+  const unreadable: Chunk = { dir: '0000000101-0000000200-0a0b0c0d', from: 101, to: 200 }
+  writeManifest(lakeDir, { height: 200, hash: '0x200', chunks: [first, unreadable] })
+  await assert.rejects((await LakeDataset.open(lakeDir, DATASET)).check())
+})

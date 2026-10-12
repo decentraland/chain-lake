@@ -89,7 +89,7 @@ async function main() {
     // Opened and read once before serving, so a lake that cannot be read, or has no manifest, fails
     // here rather than as 503s the client retries.
     const view = await LakeDataset.open(lakeDest!, dataset)
-    await view.written()
+    await view.check()
     const server = createPortal((name) => (name === dataset ? Promise.resolve(view) : undefined)).listen(0, '127.0.0.1')
     await new Promise((resolve) => server.once('listening', resolve))
     lakeUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/datasets/${dataset}`
