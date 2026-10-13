@@ -73,6 +73,13 @@ const CHUNK_DIR = /^\d{10}-\d{10}-[0-9a-f]+$/
 const MANIFEST_TTL_MS = 5000
 /** A query running longer is interrupted, so one request cannot hold a dataset's connection. */
 const QUERY_TIMEOUT_MS = 30_000
+/**
+ * A response that has read for this long stops at the end of the chunk it is on, and the client asks
+ * for the rest. Otherwise a query over a long range would read every chunk to the head in one request,
+ * which on a large lake runs past the query timeout, and a client reading from early history would
+ * read the rest of the lake again for every response.
+ */
+export const PAGE_BUDGET_MS = 5_000
 
 /**
  * A dataset of the lake, `<lakeDest>/<dataset>/`, in a local directory or an `s3://` location. It
@@ -188,19 +195,34 @@ export class LakeDataset {
   }
 
   private async read(query: EvmQuery, from: number, to: number, capped: boolean): Promise<Page> {
-    const chunks = await this.chunksIn(from, to)
-    if (query.logs.length === 0 || chunks.length === 0) return { upper: await this.header(to), logs: [], transactions: [], headers: new Map() }
+    const inRange = await this.chunksIn(from, to)
+    if (query.logs.length === 0 || inRange.length === 0) return { upper: await this.header(to), logs: [], transactions: [], headers: new Map() }
     const matches = query.logs.map(logCondition).join(' OR ')
     const withTransaction = query.logs.filter((r) => r.transaction).map(logCondition).join(' OR ') || 'FALSE'
-    let logs = (
-      await this.rows<Record<string, unknown>>(
-        `SELECT *, (${withTransaction}) AS with_transaction FROM ${this.source('logs', chunks)}
-         WHERE block_number BETWEEN ${from} AND ${to} AND (${matches})
-         ORDER BY block_number, log_index${capped ? ` LIMIT ${MAX_LOGS + 1}` : ''}`
-      )
-    ).map((r) => ({ ...r, block_number: num(r.block_number), log_index: num(r.log_index), transaction_index: num(r.transaction_index) }) as LogRow)
 
+    // One chunk at a time, in block order, until the page is full or out of time.
+    const started = Date.now()
+    const chunks: Chunk[] = []
+    let logs: LogRow[] = []
     let upper = to
+    for (const chunk of inRange) {
+      chunks.push(chunk)
+      const end = Math.min(to, chunk.to)
+      const rows = await this.rows<Record<string, unknown>>(
+        `SELECT *, (${withTransaction}) AS with_transaction FROM ${this.source('logs', [chunk])}
+         WHERE block_number BETWEEN ${Math.max(from, chunk.from)} AND ${end} AND (${matches})
+         ORDER BY block_number, log_index${capped ? ` LIMIT ${MAX_LOGS + 1 - logs.length}` : ''}`
+      )
+      logs = logs.concat(
+        rows.map((r) => ({ ...r, block_number: num(r.block_number), log_index: num(r.log_index), transaction_index: num(r.transaction_index) }) as LogRow)
+      )
+      if (capped && logs.length > MAX_LOGS) break
+      if (end < to && Date.now() - started >= PAGE_BUDGET_MS) {
+        upper = end
+        break
+      }
+    }
+
     if (capped && logs.length > MAX_LOGS) {
       // Stop before the last block, which may be cut short, unless it is the only one.
       const last = logs[MAX_LOGS].block_number
