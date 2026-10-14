@@ -94,7 +94,7 @@ process, and the service restarts as a whole.
 - **`finalized-stream`** serves finalized blocks.
 - **`stream`** also serves the blocks above the last finalized one. When a client's parent block was reorged away, it answers `409` with the canonical blocks, so the squid rolls back.
 - **What it serves:** log requests, optionally with each log's transaction, over the fields the lake stores. Anything else gets an explicit `400` instead of less data than was asked for: traces, state diffs, transaction requests, or fields the lake does not hold.
-- **How it reads:** a query reads only the chunks whose block range it touches.
+- **How it reads:** a query reads only the chunks whose block range it touches, one at a time in block order. A response ends at 20,000 logs, or at the end of the chunk it is on once it has read for 5 seconds, and the client asks for the rest from there; so a squid reindexing from early history reads each chunk once, however large the lake.
 
 ## Running
 

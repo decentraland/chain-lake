@@ -5,7 +5,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { DuckDBInstance } from '@duckdb/node-api'
 import { Chunk, Manifest, MANIFEST_FILE } from '../manifest'
-import { LakeDataset, MAX_LOGS } from './lake'
+import { LakeDataset, MAX_LOGS, PAGE_BUDGET_MS } from './lake'
 import { parseQuery } from './query'
 
 const ADDRESS = '0x' + 'aa'.repeat(20)
@@ -109,6 +109,42 @@ test('a block holding more logs than a page is served whole', async (t) => {
   const page = await lake.page(query, 1, 200)
   assert.equal(page.logs.length, MAX_LOGS + 1)
   assert.equal(page.upper.number, 150)
+})
+
+test('a page that fills up in one chunk reads only as many logs of the next as it needs', async (t) => {
+  const lakeDir = dataset(t)
+  const chunks = [await writeChunk(lakeDir, 1, 100, 100, MAX_LOGS), await writeChunk(lakeDir, 101, 200, 101, 2)]
+  writeManifest(lakeDir, { height: 200, hash: '0x200', chunks })
+  const lake = await LakeDataset.open(lakeDir, DATASET)
+  const page = await lake.page(query, 1, 200)
+  assert.equal(page.logs.length, MAX_LOGS)
+  assert.equal(page.upper.number, 100)
+  const next = await lake.page(query, 101, 200)
+  assert.deepEqual(next.logs.map((l) => l.block_number), [101, 101])
+  assert.equal(next.upper.number, 200)
+})
+
+test('a page that runs out of time stops at the end of a chunk, and the next one goes on from there', async (t) => {
+  const lakeDir = dataset(t)
+  const chunks = [await writeChunk(lakeDir, 1, 100, 50), await writeChunk(lakeDir, 101, 200, 150), await writeChunk(lakeDir, 201, 300, 250)]
+  writeManifest(lakeDir, { height: 300, hash: '0x300', chunks })
+  const lake = await LakeDataset.open(lakeDir, DATASET)
+  assert.deepEqual((await lake.page(query, 1, 300)).logs.map((l) => l.block_number), [50, 150, 250])
+
+  // Every chunk takes the whole budget.
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => (now += PAGE_BUDGET_MS))
+  const pages = []
+  for (let from = 1; from <= 300; ) {
+    const page = await lake.page(query, from, 300)
+    pages.push({ logs: page.logs.map((l) => l.block_number), upper: page.upper.number })
+    from = page.upper.number + 1
+  }
+  assert.deepEqual(pages, [
+    { logs: [50], upper: 100 },
+    { logs: [150], upper: 200 },
+    { logs: [250], upper: 300 },
+  ])
 })
 
 test('check reads the last chunk, and fails on a lake that cannot be read', async (t) => {
