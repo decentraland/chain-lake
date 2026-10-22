@@ -32,6 +32,21 @@ test('a rate limit is waited out and asked again', async () => {
   }
 })
 
+test("a proxy's error page in front of the node is waited out and asked again", async () => {
+  for (const status of [409, 408, 502]) {
+    const { url, server, requests } = await node([
+      [status, '<!doctype html><html>try again later</html>'],
+      [200, [{ id: 0, result: '0x10' }]],
+    ])
+    try {
+      assert.equal(await new RpcClient(url).call('eth_blockNumber', []), '0x10')
+      assert.equal(requests(), 2)
+    } finally {
+      server.close()
+    }
+  }
+})
+
 test('a refusal is final: a bad key, or a batch rejected as a whole', async () => {
   for (const [status, body] of [
     [401, '<html>unauthorized</html>'],

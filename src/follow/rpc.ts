@@ -29,14 +29,21 @@ const RETRIES = 8
 /** Longer than any answer of a healthy node; a hung connection is dropped and retried. */
 const TIMEOUT_MS = 60_000
 
+/**
+ * The statuses that say the request itself is wrong: a bad key, a wrong URL or method, a batch too
+ * large. Any other failing status is the node, or a proxy in front of it, having trouble (a 409 or 408
+ * page from a CDN, a 429, a 5xx), and is asked again.
+ */
+const REFUSALS = new Set([400, 401, 403, 404, 405, 413, 414, 431])
+
 function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
- * A JSON-RPC client that sends calls in batches. Transport failures, 429s and 5xx answers are
- * retried with backoff; an error the node returns for a call is handed back to the caller, which
- * decides (a log range too wide, for instance, is split and asked again).
+ * A JSON-RPC client that sends calls in batches. Transport failures and failing statuses other than
+ * a refusal (see `REFUSALS`) are retried with backoff; an error the node returns for a call is handed
+ * back to the caller, which decides (a log range too wide, for instance, is split and asked again).
  */
 export class RpcClient {
   constructor(readonly url: string, private readonly batchSize = 50) {}
@@ -61,11 +68,11 @@ export class RpcClient {
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await fetch(this.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body, signal: AbortSignal.timeout(TIMEOUT_MS) })
-        if (res.status === 429 || res.status >= 500) {
-          await res.body?.cancel()
-          throw new Error(`HTTP ${res.status}`)
+        if (!res.ok) {
+          const text = (await res.text().catch(() => '')).slice(0, 200)
+          if (REFUSALS.has(res.status)) throw new RpcRejected(`HTTP ${res.status}: ${text}`)
+          throw new Error(`HTTP ${res.status}: ${text}`)
         }
-        if (!res.ok) throw new RpcRejected(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
         const answers = (await res.json()) as { id: number; result?: T; error?: { code: number; message: string } }[] | { error?: { message: string } }
         if (!Array.isArray(answers)) {
           if (answers?.error) throw new RpcRejected(`the node rejected a batch of ${calls.length} calls: ${answers.error.message}`)
