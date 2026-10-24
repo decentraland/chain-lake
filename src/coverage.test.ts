@@ -14,8 +14,8 @@ const config = (addresses: string[]): DatasetConfig => ({
   factories: [{ name: 'Factory', address: F, fromBlock: 0, topic0: '0x' + 'cf'.repeat(32), addressTopic: 1 }],
 })
 
-test('a dataset records the configured contracts and factories whose history it holds', () => {
-  assert.deepEqual(coverageOf(config([B, A])), { contracts: [A, B, F] })
+test('a dataset records the configured contracts and factories whose history it holds, and the block each factory is held from', () => {
+  assert.deepEqual(coverageOf(config([B, A])), { contracts: [A, B, F], factories: { [F]: 0 } })
 })
 
 test('a contract added to the config after the backfill started stops the dataset from being served', () => {

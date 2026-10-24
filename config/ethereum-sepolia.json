@@ -51,5 +51,14 @@
       "address": "0x11a970e744ff69db8f461c2d0fc91d4293914301"
     }
   ],
-  "factories": []
+  "factories": [
+    {
+      "name": "VestingFactory",
+      "address": "0x71c84760df0537f7db286274817462dc2e6c1366",
+      "fromBlock": 3831258,
+      "topic0": "0xeaa996f76fa9fcacd351918a2a275ae6d45845f79256ffbe8c0a87ca608e9970",
+      "addressTopic": 1,
+      "childName": "vesting"
+    }
+  ]
 }
