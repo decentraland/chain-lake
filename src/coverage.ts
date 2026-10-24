@@ -8,6 +8,12 @@ export const COVERAGE_FILE = 'coverage.json'
 export interface Coverage {
   /** The configured contracts and factories whose whole history the lake holds, or will once backfilled. */
   contracts: string[]
+  /**
+   * The block each factory's history is held from. A config that moves a factory's `fromBlock` earlier
+   * has it absorbed again from there. Lakes recorded before this field hold each factory from its
+   * configured block.
+   */
+  factories?: Record<string, number>
   /** Set once the backfill reached `height`; the follower took over from there. */
   complete?: { height: number }
   /** Set by a development run that left history out. Such a lake is never served. */
@@ -15,7 +21,12 @@ export interface Coverage {
 }
 
 export function coverageOf(config: DatasetConfig): Coverage {
-  return { contracts: configuredContracts(config).map((c) => c.address).sort() }
+  return { contracts: configuredContracts(config).map((c) => c.address).sort(), factories: factoriesOf(config) }
+}
+
+/** The block the config follows each factory from. */
+export function factoriesOf(config: DatasetConfig): Record<string, number> {
+  return Object.fromEntries(config.factories.map((f) => [f.address, f.fromBlock]))
 }
 
 export function readCoverage(store: Store): Promise<Versioned<Coverage> | undefined> {

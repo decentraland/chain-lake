@@ -100,6 +100,15 @@ test('the contracts a config gained are those its coverage lacks', () => {
   assert.deepEqual(missingContracts(before, { contracts: [OLD] }), [])
 })
 
+test('a factory the config follows from an earlier block than the lake holds it from is missing too', () => {
+  const covered = { contracts: [OLD, FACTORY] }
+  assert.deepEqual(missingContracts(after, { ...covered, factories: { [FACTORY]: 9 } }).map((c) => c.address), [FACTORY])
+  assert.deepEqual(missingContracts(after, { ...covered, factories: { [FACTORY]: 5 } }), [])
+  assert.deepEqual(missingContracts(after, { ...covered, factories: { [FACTORY]: 2 } }), [])
+  // A lake recorded before factories' blocks were: held from the configured block.
+  assert.deepEqual(missingContracts(after, covered), [])
+})
+
 test('new history goes into the chunk covering each block, or into a chunk of its own in a gap', () => {
   const plan = planChunks(
     [
@@ -141,7 +150,52 @@ test("a factory added to a complete lake comes with its whole history, and its c
       ['vesting', CHILD],
     ]
   )
-  assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!.value.contracts, [OLD, FACTORY].sort())
+  const coverage = (await store.read<Coverage>(COVERAGE_FILE))!.value
+  assert.deepEqual(coverage.contracts, [OLD, FACTORY].sort())
+  assert.deepEqual(coverage.factories, { [FACTORY]: 5 })
+})
+
+test('reading several ranges at once absorbs the same history', async (t) => {
+  const { lakeDir, store } = await lake(t)
+  await absorb({ lakeDest: lakeDir, config: after, store, fetch: rpc, maxRange: 3, concurrency: 4 })
+  assert.deepEqual((await logsOf(lakeDir, CHILD)).blocks, [20, 35, 45])
+  assert.deepEqual((await logsOf(lakeDir, FACTORY)).blocks, [15])
+  assert.deepEqual((await store.read<Registry>(REGISTRY_FILE))!.value.contracts.map((c) => c.address), [OLD, FACTORY, CHILD])
+})
+
+test("a factory moved to an earlier block is absorbed again from there, with the children it created before", async (t) => {
+  const { lakeDir, store } = await lake(t)
+  await absorb({ lakeDest: lakeDir, config: after, store, fetch: rpc, maxRange: 7 })
+  const EARLY = '0x' + 'ee'.repeat(20)
+  chain.set(3, block(3, [{ address: FACTORY, topics: [CREATED, word(EARLY)], tx: 0 }]))
+  chain.set(25, block(25, [{ address: EARLY, topics: [EVENT], tx: 0 }]))
+  t.after(() => (chain.delete(3), chain.delete(25)))
+
+  const earlier: DatasetConfig = { ...after, factories: [{ ...factory, fromBlock: 2 }] }
+  await absorb({ lakeDest: lakeDir, config: earlier, store, fetch: rpc, maxRange: 7, concurrency: 2 })
+
+  assert.deepEqual((await logsOf(lakeDir, FACTORY)).blocks, [3, 15])
+  assert.deepEqual((await logsOf(lakeDir, EARLY)).blocks, [25])
+  // What the first run absorbed is still there, once.
+  assert.deepEqual((await logsOf(lakeDir, CHILD)).blocks, [20, 35, 45])
+  assert.deepEqual((await store.read<Registry>(REGISTRY_FILE))!.value.contracts.map((c) => c.address), [OLD, FACTORY, CHILD, EARLY])
+  assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!.value.factories, { [FACTORY]: 2 })
+})
+
+test('coverage another process records meanwhile is kept', async (t) => {
+  const { lakeDir, store } = await lake(t)
+  const OTHER = '0x' + 'bb'.repeat(20)
+  let raced = false
+  const racing: FetchHistory = async (...args) => {
+    if (!raced) {
+      raced = true
+      const current = (await store.read<Coverage>(COVERAGE_FILE))!
+      await store.write<Coverage>(COVERAGE_FILE, { ...current.value, contracts: [...current.value.contracts, OTHER] }, current.version)
+    }
+    return rpc(...args)
+  }
+  await absorb({ lakeDest: lakeDir, config: after, store, fetch: racing, maxRange: 100 })
+  assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!.value.contracts, [OLD, OTHER, FACTORY].sort())
 })
 
 test('a lake that already holds every configured contract is left as it is', async (t) => {

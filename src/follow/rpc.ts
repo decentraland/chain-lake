@@ -92,3 +92,20 @@ export class RpcClient {
     }
   }
 }
+
+/**
+ * Runs `f` until the node answers. RPC trouble is waited out, with a backoff of up to a minute, for as
+ * long as it lasts: an outage only stalls the caller. Anything else is thrown.
+ */
+export async function untilAnswered<T>(what: string, f: () => Promise<T>, log: { warn(fields: object, message: string): void }): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await f()
+    } catch (e) {
+      if (!(e instanceof RpcTrouble)) throw e
+      const delay = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6))
+      log.warn({ err: e }, `${what} failed (attempt ${attempt}); retrying in ${delay / 1000} s`)
+      await wait(delay)
+    }
+  }
+}

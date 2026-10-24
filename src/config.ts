@@ -30,6 +30,9 @@ export function loadConfig(dataset = required('DATASET')): DatasetConfig {
   for (const c of [...config.contracts, ...config.factories]) {
     if (!/^0x[0-9a-f]{40}$/.test(c.address)) throw new Error(`${c.name}: ${c.address} is not a lowercase address`)
   }
+  for (const f of config.factories) {
+    if (f.childName !== undefined && (typeof f.childName !== 'string' || !f.childName)) throw new Error(`${f.name}: childName must be a non-empty string`)
+  }
   return config
 }
 

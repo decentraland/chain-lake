@@ -3,16 +3,18 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
+import { TableSchema } from '@subsquid/file-store-parquet'
 import { createLogger, Logger } from '@subsquid/logger'
 import { DatasetConfig, Factory, loadConfig, required } from './config'
-import { Coverage, COVERAGE_FILE, readCoverage } from './coverage'
+import { Coverage, COVERAGE_FILE, factoriesOf, readCoverage } from './coverage'
 import { configuredContracts, RegisteredContract, Registry, REGISTRY_FILE } from './discover'
 import { fetchFollowing } from './follow/fetch'
-import { RpcClient, RpcTrouble } from './follow/rpc'
+import { RpcClient, untilAnswered } from './follow/rpc'
 import { Chunk, Manifest, MANIFEST_FILE } from './manifest'
 import { rpcUrl } from './serve/headers'
 import { Conflict, openStore, Store } from './store'
-import { LakeBlock } from './write'
+import { columns } from './tables'
+import { LakeBlock, writeBlocks } from './write'
 
 const logger = createLogger('lake:absorb')
 
@@ -24,10 +26,14 @@ export type FetchHistory = (
   to: number
 ) => Promise<{ blocks: LakeBlock[]; created: RegisteredContract[] }>
 
-/** The configured contracts and factories whose history the lake does not hold. */
+/**
+ * The configured contracts and factories whose history the lake does not hold: those it lacks, and the
+ * factories the config follows from an earlier block than the lake holds them from.
+ */
 export function missingContracts(config: DatasetConfig, coverage: Coverage): RegisteredContract[] {
   const covered = new Set(coverage.contracts)
-  return configuredContracts(config).filter((c) => !covered.has(c.address))
+  const earlier = new Set(config.factories.filter((f) => f.fromBlock < (coverage.factories?.[f.address] ?? f.fromBlock)).map((f) => f.address))
+  return configuredContracts(config).filter((c) => !covered.has(c.address) || earlier.has(c.address))
 }
 
 /**
@@ -52,10 +58,14 @@ export async function absorb(options: {
   fetch: FetchHistory
   /** Blocks read per fetch. */
   maxRange: number
+  /** Fetches run at once. */
+  concurrency?: number
   log?: Logger
   maxAttempts?: number
 }): Promise<void> {
   const { lakeDest, config, store, fetch, maxRange } = options
+  const concurrency = Math.max(1, options.concurrency ?? 1)
+  const maxAttempts = options.maxAttempts ?? 5
   const log = options.log ?? logger
   const coverage = await readCoverage(store)
   if (!coverage?.value.complete) throw new Error(`${config.dataset}: only a complete lake takes new contracts`)
@@ -67,33 +77,48 @@ export async function absorb(options: {
   const start = Math.min(...missing.map((c) => factories.find((f) => f.address === c.address)?.fromBlock ?? config.fromBlock))
   log.info(`absorbing ${missing.map((c) => c.name).join(', ')} from block ${start}, over RPC`)
 
-  const followed = new Set(missingAddresses)
-  const created: RegisteredContract[] = []
+  const created = new Map<string, RegisteredContract>()
   const blocks = new Map<number, LakeBlock>()
   let fetchedTo = start - 1
   const writer = randomBytes(16).toString('hex')
   const written = new Map<string, Chunk>()
-  const chunks = await ChunkFiles.open(lakeDest, config.dataset)
 
+  /**
+   * Reads the new history of [from, to]: first the contracts the new factories created there, then the
+   * logs of all of them. Knowing every contract before reading any logs lets the ranges be read at once.
+   */
+  async function read(from: number, to: number): Promise<void> {
+    const ranges: [number, number][] = []
+    for (let a = from; a <= to; a += maxRange) ranges.push([a, Math.min(a + maxRange - 1, to)])
+    if (factories.length) {
+      await inParallel(ranges, concurrency, async ([a, b]) => {
+        for (const c of (await fetch(missingAddresses, factories, a, b)).created) {
+          if (!missingAddresses.has(c.address) && !created.has(c.address)) created.set(c.address, c)
+        }
+      })
+      log.info(`blocks ${from}-${to}: ${created.size} contracts created`)
+    }
+    const followed = new Set([...missingAddresses, ...created.keys()])
+    let fetches = 0
+    await inParallel(ranges, concurrency, async ([a, b]) => {
+      const range = await fetch(followed, factories, a, b)
+      const unknown = range.created.find((c) => !followed.has(c.address))
+      if (unknown) throw new Error(`${config.dataset}: block ${unknown.createdAt?.block} creates ${unknown.address}, which reading the creations did not find`)
+      for (const block of range.blocks) if (block.logs.length > 0) blocks.set(block.header.number, block)
+      if (++fetches % 100 === 0) log.info(`read ${fetches} of ${ranges.length} ranges: ${blocks.size} blocks with logs`)
+    })
+  }
+
+  const chunks = await ChunkFiles.open(lakeDest, config.dataset)
   try {
-    for (let attempt = 0; attempt < (options.maxAttempts ?? 5); attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const manifest = await store.read<Manifest>(MANIFEST_FILE)
       const registry = await store.read<Registry>(REGISTRY_FILE)
       if (!manifest || !registry) throw new Error(`${config.dataset}: the lake has no manifest or registry`)
-
-      let fetches = 0
-      for (let from = fetchedTo + 1; from <= manifest.value.height; from += maxRange) {
-        const to = Math.min(from + maxRange - 1, manifest.value.height)
-        const range = await fetch(followed, factories, from, to)
-        for (const c of range.created) {
-          if (followed.has(c.address)) continue
-          followed.add(c.address)
-          created.push(c)
-        }
-        for (const block of range.blocks) if (block.logs.length > 0) blocks.set(block.header.number, block)
-        if (++fetches % 100 === 0) log.info(`read to block ${to}: ${blocks.size} blocks with logs, ${created.length} contracts created`)
+      if (manifest.value.height > fetchedTo) {
+        await read(fetchedTo + 1, manifest.value.height)
+        fetchedTo = manifest.value.height
       }
-      fetchedTo = Math.max(fetchedTo, manifest.value.height)
 
       const plan = planChunks(manifest.value.chunks, [...blocks.keys()])
       const next: Chunk[] = []
@@ -114,7 +139,8 @@ export async function absorb(options: {
       }
 
       const known = new Set(registry.value.contracts.map((c) => c.address))
-      const added = [...missing, ...created].filter((c) => !known.has(c.address))
+      const children = [...created.values()].sort((x, y) => x.createdAt!.block - y.createdAt!.block || x.createdAt!.logIndex - y.createdAt!.logIndex)
+      const added = [...missing, ...children].filter((c) => !known.has(c.address))
       try {
         if (added.length) await store.write<Registry>(REGISTRY_FILE, { ...registry.value, contracts: [...registry.value.contracts, ...added] }, registry.version)
         await store.write<Manifest>(MANIFEST_FILE, { ...manifest.value, chunks: next }, manifest.version)
@@ -123,15 +149,44 @@ export async function absorb(options: {
         log.info(`the lake moved while absorbing (attempt ${attempt + 1}); reading the new blocks too`)
         continue
       }
-      const contracts = [...new Set([...coverage.value.contracts, ...missingAddresses])].sort()
-      await store.write<Coverage>(COVERAGE_FILE, { ...coverage.value, contracts }, coverage.version)
-      log.info(`absorbed ${missing.length} contracts and ${created.length} they created: ${blocks.size} blocks into ${written.size} chunks`)
+      await recordCoverage(store, config, factories, missingAddresses, maxAttempts)
+      log.info(`absorbed ${missing.length} contracts and ${created.size} they created: ${blocks.size} blocks into ${written.size} chunks`)
       return
     }
     throw new Error(`${config.dataset}: the lake kept moving while absorbing; run it again`)
   } finally {
     chunks.close()
   }
+}
+
+/**
+ * Records that the lake holds the absorbed contracts, and each factory from the block it was read from.
+ * Another process may record coverage meanwhile (a second task absorbing the same contracts): the
+ * record is then read again and merged, as both hold the same history.
+ */
+async function recordCoverage(store: Store, config: DatasetConfig, absorbed: Factory[], addresses: Set<string>, maxAttempts: number): Promise<void> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const current = (await readCoverage(store))!
+    const contracts = [...new Set([...current.value.contracts, ...addresses])].sort()
+    const factories = { ...factoriesOf(config), ...current.value.factories }
+    for (const f of absorbed) factories[f.address] = f.fromBlock
+    try {
+      await store.write<Coverage>(COVERAGE_FILE, { ...current.value, contracts, factories }, current.version)
+      return
+    } catch (e) {
+      if (!(e instanceof Conflict)) throw e
+    }
+  }
+  throw new Error(`${config.dataset}: the coverage kept changing while recording it; run it again`)
+}
+
+/** Runs `f` on every item, `concurrency` at a time. */
+async function inParallel<T>(items: T[], concurrency: number, f: (item: T) => Promise<void>): Promise<void> {
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) await f(items[next++])
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker))
 }
 
 /** A chunk of the new manifest, and the blocks of new history it takes, if any. */
@@ -143,37 +198,46 @@ interface Target {
 
 /**
  * Where each block of new history goes: into the chunk that covers it, or, in a gap between chunks, into
- * a new chunk spanning exactly the gap's new blocks. Chunks stay in block order and never overlap.
+ * a new chunk spanning exactly the gap's new blocks. Chunks stay in block order and never overlap. The
+ * history goes into the chunks it falls in whatever their size: absorbing is meant for contracts with
+ * little history next to what the lake holds.
  */
 export function planChunks(existing: Chunk[], numbers: number[]): Target[] {
   const sorted = [...existing].sort((a, b) => a.from - b.from)
-  const targets: Target[] = sorted.map((chunk) => ({ chunk, original: chunk, blocks: [] }))
-  const gaps = new Map<number, number[]>()
-  for (const n of [...numbers].sort((a, b) => a - b)) {
-    const index = sorted.findIndex((c) => c.from <= n && n <= c.to)
-    if (index >= 0) {
-      targets[index].blocks.push(n)
-    } else {
-      // The gap is named by the first chunk after it, or by none past the last one.
-      const after = sorted.findIndex((c) => c.from > n)
-      const gap = after < 0 ? sorted.length : after
-      gaps.set(gap, [...(gaps.get(gap) ?? []), n])
-    }
-  }
+  const pending = [...numbers].sort((a, b) => a - b)
   const result: Target[] = []
-  for (let i = 0; i <= sorted.length; i++) {
-    const gap = gaps.get(i)
-    if (gap) result.push({ chunk: { dir: '', from: gap[0], to: gap[gap.length - 1] }, blocks: gap })
-    if (i < sorted.length) result.push(targets[i])
+  let i = 0
+  let gap: number[] = []
+  const closeGap = () => {
+    if (gap.length) result.push({ chunk: { dir: '', from: gap[0], to: gap[gap.length - 1] }, blocks: gap })
+    gap = []
   }
+  for (const chunk of sorted) {
+    while (i < pending.length && pending[i] < chunk.from) gap.push(pending[i++])
+    closeGap()
+    const blocks: number[] = []
+    while (i < pending.length && pending[i] <= chunk.to) blocks.push(pending[i++])
+    result.push({ chunk, original: chunk, blocks })
+  }
+  while (i < pending.length) gap.push(pending[i++])
+  closeGap()
   return result
 }
 
 const pad = (n: number) => String(n).padStart(10, '0')
 
-const BLOCK_COLUMNS = `{number: 'BIGINT', hash: 'VARCHAR', parent_hash: 'VARCHAR', timestamp: 'BIGINT'}`
-const LOG_COLUMNS = `{block_number: 'BIGINT', log_index: 'INTEGER', transaction_index: 'INTEGER', transaction_hash: 'VARCHAR', address: 'VARCHAR', topic0: 'VARCHAR', topic1: 'VARCHAR', topic2: 'VARCHAR', topic3: 'VARCHAR', data: 'VARCHAR'}`
-const TRANSACTION_COLUMNS = `{block_number: 'BIGINT', transaction_index: 'INTEGER', hash: 'VARCHAR', "from": 'VARCHAR', "to": 'VARCHAR', input: 'VARCHAR'}`
+/** DuckDB's type for each Parquet primitive type the lake's columns use. */
+const DUCKDB_TYPES: Record<number, string> = { 1: 'INTEGER', 2: 'BIGINT', 6: 'VARCHAR' }
+
+/** A table's columns as `read_json` takes them, from the schema the follower writes with. */
+function jsonColumns(schema: TableSchema): string {
+  const entries = Object.entries(schema).map(([name, column]) => {
+    const type = column.type.isNested ? undefined : DUCKDB_TYPES[column.type.primitiveType]
+    if (!type) throw new Error(`column ${name} has a type absorb cannot stage`)
+    return `"${name}": '${type}'`
+  })
+  return `{${entries.join(', ')}}`
+}
 
 /** The chunk files of a dataset, read and written with DuckDB, in a local directory or on S3. */
 class ChunkFiles {
@@ -211,16 +275,20 @@ class ChunkFiles {
     }
     const dir = `${this.base}/${chunk.dir}`
     if (!dir.startsWith('s3://')) mkdirSync(dir, { recursive: true })
-    const old = (table: string) => (original ? `SELECT * FROM read_parquet('${this.base}/${original.dir}/${table}.parquet') UNION ALL ` : '')
-    const json = (file: string, columns: string) => `SELECT * FROM read_json('${file}', format = 'newline_delimited', columns = ${columns})`
-    const copy = (table: string, columns: string, key: string, file: string) =>
-      this.db.run(
-        `COPY (SELECT * FROM (${old(table)}${json(file, columns)}) QUALIFY row_number() OVER (PARTITION BY ${key}) = 1 ORDER BY ${key})
+    // By name, not by position, and in the follower's column order.
+    const old = (table: string) => (original ? `SELECT * FROM read_parquet('${this.base}/${original.dir}/${table}.parquet') UNION ALL BY NAME ` : '')
+    const copy = async (table: keyof typeof columns, key: string, file: string) => {
+      const schema = columns[table]
+      const names = Object.keys(schema).map((n) => `"${n}"`).join(', ')
+      const json = `SELECT * FROM read_json('${file}', format = 'newline_delimited', columns = ${jsonColumns(schema)})`
+      await this.db.run(
+        `COPY (SELECT ${names} FROM (${old(table)}${json}) QUALIFY row_number() OVER (PARTITION BY ${key}) = 1 ORDER BY ${key})
          TO '${dir}/${table}.parquet' (FORMAT PARQUET, COMPRESSION GZIP)`
       )
-    await copy('blocks', BLOCK_COLUMNS, 'number', files.blocks)
-    await copy('logs', LOG_COLUMNS, 'block_number, log_index', files.logs)
-    await copy('transactions', TRANSACTION_COLUMNS, 'block_number, transaction_index', files.transactions)
+    }
+    await copy('blocks', 'number', files.blocks)
+    await copy('logs', 'block_number, log_index', files.logs)
+    await copy('transactions', 'block_number, transaction_index', files.transactions)
   }
 
   close(): void {
@@ -230,50 +298,12 @@ class ChunkFiles {
   }
 }
 
-/** The rows of the lake's tables for these blocks, as `writeBlocks` writes them. */
+/** The rows of the lake's tables for these blocks, written by `writeBlocks`, as the follower writes them. */
 function toRows(blocks: LakeBlock[]) {
   const rows = { blocks: [] as object[], logs: [] as object[], transactions: [] as object[] }
-  for (const block of blocks) {
-    const number = block.header.number
-    rows.blocks.push({ number, hash: block.header.hash, parent_hash: block.header.parentHash, timestamp: Math.floor(block.header.timestamp / 1000) })
-    for (const log of block.logs) {
-      rows.logs.push({
-        block_number: number,
-        log_index: log.logIndex,
-        transaction_index: log.transactionIndex,
-        transaction_hash: log.transactionHash,
-        address: log.address.toLowerCase(),
-        topic0: log.topics[0] ?? null,
-        topic1: log.topics[1] ?? null,
-        topic2: log.topics[2] ?? null,
-        topic3: log.topics[3] ?? null,
-        data: log.data,
-      })
-    }
-    for (const tx of block.transactions) {
-      rows.transactions.push({
-        block_number: number,
-        transaction_index: tx.transactionIndex,
-        hash: tx.hash,
-        from: tx.from.toLowerCase(),
-        to: tx.to ? tx.to.toLowerCase() : null,
-        input: tx.input,
-      })
-    }
-  }
+  const collect = (into: object[]) => ({ write: (row: Record<string, unknown>) => into.push(row) })
+  writeBlocks({ blocks: collect(rows.blocks), logs: collect(rows.logs), transactions: collect(rows.transactions) }, blocks)
   return rows
-}
-
-/** Retries what a node in trouble may answer next time: one behind, a reorg, a timeout. */
-async function retrying<T>(what: () => Promise<T>, attempts = 8): Promise<T> {
-  for (let i = 1; ; i++) {
-    try {
-      return await what()
-    } catch (e) {
-      if (!(e instanceof RpcTrouble) || i >= attempts) throw e
-      await new Promise((resolve) => setTimeout(resolve, Math.min(30_000, 500 * 2 ** i)))
-    }
-  }
 }
 
 async function main() {
@@ -287,7 +317,11 @@ async function main() {
     config,
     store,
     maxRange: Number(process.env.ABSORB_MAX_RANGE || 10_000),
-    fetch: (followed, factories, from, to) => retrying(() => fetchFollowing(rpc, followed, factories, perCall, from, to)),
+    concurrency: Number(process.env.ABSORB_CONCURRENCY || 4),
+    // RPC trouble is waited out however long it lasts, as the follower does: giving up would start the
+    // whole absorb over.
+    fetch: (followed, factories, from, to) =>
+      untilAnswered(`${config.dataset}: reading blocks ${from}-${to}`, () => fetchFollowing(rpc, followed, factories, perCall, from, to), logger),
   })
 }
 

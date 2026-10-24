@@ -26,8 +26,8 @@ One dataset per chain (`ethereum-mainnet`, `polygon-mainnet`, `ethereum-sepolia`
 - **The header of every block** holding one of those logs.
 
 The followed contracts are the configured ones, the factories, and every contract the factories create
-(the CollectionV2 collections). The latter are found from the factories' `ProxyCreated` events, and
-`contracts.json` records them.
+(CollectionV2 collections, vesting contracts). Each factory names the event that announces a new
+contract and the topic that holds its address, and `contracts.json` records every contract found.
 
 ```
 <lake>/<dataset>/manifest.json                            the last block the lake holds, and the chunks that hold it
@@ -63,14 +63,27 @@ an interrupted backfill resumes where it stopped. Once complete, `coverage.json`
 never reads the SQD portal for that dataset again.
 
 A contract or factory added to the config of a complete lake is absorbed before the lake is followed
-again: `absorb` reads its history over RPC, and that of every contract the new factory created, from
-its first block up to the lake's height. It merges each block into the chunk that covers it (blocks
-in a gap between chunks get a chunk of their own), writes each changed chunk to a new folder, and
-moves the lake to them with one manifest write, so the portal serves the lake before or after, never
-in between. A run that stops halfway is run again: merging the same history twice changes nothing.
-It can outlast a health check, so it does not hold the task back: that dataset answers 503 until it
-is done, and squids retry. If the task a deployment replaces extends the lake meanwhile, `absorb`
-reads those blocks too and publishes again, and that task stops at its next commit.
+again, and so is a factory whose `fromBlock` moved earlier: `coverage.json` records the block each
+factory is held from. `absorb` reads the history over RPC, from the first block that can hold it up
+to the lake's height: first the contracts the new factories created, then the logs of all of them,
+several ranges at once. RPC trouble is waited out for as long as it lasts, as the follower does. It
+merges each block into the chunk that covers it (blocks in a gap between chunks get a chunk of their
+own), writes each changed chunk to a new folder, and moves the lake to them with one manifest write,
+so the portal serves the lake before or after, never in between. A run that stops halfway is run
+again: merging the same history twice changes nothing. Absorbing is meant for contracts with little
+history next to the lake's: the history goes into the chunks it falls in, whatever their size.
+
+It can outlast a health check, so it does not hold the task back. Meanwhile `live` serves that
+dataset as its lake stood, without new blocks: once the task a deployment replaces stops, the
+dataset's squids wait for new blocks instead of getting 503s, and the new contracts' history is
+served once absorbed. Read the new contracts only once `GET /health` no longer reports the dataset
+as `absorbing`. If the task a deployment replaces extends the lake meanwhile, `absorb` reads those
+blocks too and publishes again, and that task stops at its next commit.
+
+A factory removed from the config and added back (a deployment rolled back and forward again) is not
+absorbed again: `coverage.json` still lists it, and the contracts it created in between are missed.
+To absorb them, take the factory out of `contracts` in `coverage.json`: it is then absorbed again
+from its `fromBlock`, and the history the lake already holds merges without change.
 
 `live` refuses a lake whose history it cannot vouch for:
 
@@ -131,7 +144,7 @@ npm run live                          # then point a squid at http://localhost:8
 | `RPC_URL_<DATASET>` | `live`, `follow`, `parity`, the portal | JSON-RPC endpoint of a dataset, e.g. `RPC_URL_POLYGON_MAINNET`; `rpc.decentraland.org` by default |
 | `PORT` | `live`, `serve` | Portal port, 8100 by default |
 | `MAX_RANGE`, `ADDRESSES_PER_CALL` | `live`, `follow` | Blocks and addresses per `eth_getLogs` (2000 and 500) |
-| `ABSORB_MAX_RANGE` | `absorb` | Blocks per `eth_getLogs` while absorbing history (10,000) |
+| `ABSORB_MAX_RANGE`, `ABSORB_CONCURRENCY` | `absorb` | Blocks per `eth_getLogs` while absorbing history, and ranges read at once (10,000 and 4) |
 | `POLL_MS` | `live`, `follow` | How often a follower that is caught up looks for newly finalized blocks (5000) |
 | `CHUNK_SIZE_MB` | `backfill`, `live`, `follow` | Size of the data a chunk holds before it is written (64) |
 | `FLUSH_INTERVAL_MS` | `live` | Writes a chunk at least this often (30 minutes) |

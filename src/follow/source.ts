@@ -3,7 +3,7 @@ import { DatasetConfig } from '../config'
 import { followedAddresses, Registry } from '../discover'
 import { LakeBlock } from '../write'
 import { fetchFollowing, int, NodeBehind, RpcBlock } from './fetch'
-import { RpcClient, RpcTrouble } from './rpc'
+import { RpcClient, untilAnswered } from './rpc'
 
 const logger = createLogger('lake:follow')
 
@@ -92,16 +92,7 @@ export class RpcSource {
    * picks up where it was once the node answers again, while the portal keeps serving what it has.
    * Any other error is a bug or a broken setup, and ends the run.
    */
-  private async retrying<T>(what: string, f: () => Promise<T>): Promise<T> {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await f()
-      } catch (e) {
-        if (!(e instanceof RpcTrouble)) throw e
-        const delay = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6))
-        logger.warn({ err: e }, `${this.config.dataset}: ${what} failed (attempt ${attempt}); retrying in ${delay / 1000} s`)
-        await new Promise((resolve) => setTimeout(resolve, delay))
-      }
-    }
+  private retrying<T>(what: string, f: () => Promise<T>): Promise<T> {
+    return untilAnswered(`${this.config.dataset}: ${what}`, f, logger)
   }
 }
