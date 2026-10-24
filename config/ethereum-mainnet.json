@@ -215,5 +215,14 @@
       "address": "0xdd9c7bc159dacb19c9f6b9d7e23948c87aa2397f"
     }
   ],
-  "factories": []
+  "factories": [
+    {
+      "name": "VestingFactory",
+      "address": "0xe357273545c152f07afe2c38257b7b653fd3f6d0",
+      "fromBlock": 12732617,
+      "topic0": "0xeaa996f76fa9fcacd351918a2a275ae6d45845f79256ffbe8c0a87ca608e9970",
+      "addressTopic": 1,
+      "childName": "vesting"
+    }
+  ]
 }

@@ -109,7 +109,7 @@ export function createdIn(blocks: FactoryLogs[], factories: Factory[]): Register
       const address = createdAddress(log.topics, factory.addressTopic)
       if (seen.has(address)) continue
       seen.add(address)
-      created.push({ name: 'collection', address, factory: factory.name, createdAt: { block: block.header.number, logIndex: log.logIndex, transactionHash: log.transactionHash } })
+      created.push({ name: factory.childName ?? 'collection', address, factory: factory.name, createdAt: { block: block.header.number, logIndex: log.logIndex, transactionHash: log.transactionHash } })
     }
   }
   return created

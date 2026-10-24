@@ -11,6 +11,8 @@ export interface Factory extends Contract {
   fromBlock: number
   topic0: string
   addressTopic: number
+  /** The name the contracts it creates are registered under; `collection` by default. */
+  childName?: string
 }
 
 export interface DatasetConfig {

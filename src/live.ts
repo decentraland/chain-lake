@@ -3,6 +3,7 @@ import { join } from 'path'
 import { run } from '@subsquid/batch-processor'
 import { createLogger } from '@subsquid/logger'
 import { datasetsFromEnv, loadConfig, required } from './config'
+import { missingContracts } from './absorb'
 import { bootstrap } from './bootstrap'
 import { readCoverage } from './coverage'
 import { openRegistry } from './discover'
@@ -59,7 +60,8 @@ async function main() {
     },
     // Ready once every dataset that was already complete is served again, so a deployment keeps the
     // task it replaces until then. A first backfill takes hours and does not hold the task back: the
-    // portal had nothing to serve for that dataset before either.
+    // portal had nothing to serve for that dataset before either. Nor does absorbing new contracts,
+    // which can outlast a health check: that dataset is unavailable meanwhile, and squids retry.
     () => ({ ready: ![...states.values()].includes('starting'), datasets: Object.fromEntries(states) })
   ).listen(port, () => logger.info(`portal listening on ${port} for ${datasets.join(', ')}`))
 
@@ -77,8 +79,13 @@ async function main() {
   }
 }
 
-/** `starting`: complete, and about to be served; `backfilling`: filling up from the SQD portal. */
-type DatasetState = 'starting' | 'backfilling' | 'ready'
+/**
+ * `starting`: complete, and about to be served; `backfilling`: filling up from the SQD portal;
+ * `absorbing`: taking in the history of contracts its config gained, over RPC. Neither of the last
+ * two holds the task back: they take longer than a health check waits, and a task killed meanwhile
+ * would start them over.
+ */
+type DatasetState = 'starting' | 'backfilling' | 'absorbing' | 'ready'
 
 /** The commands this process runs, stopped with it. */
 const children = new Set<ChildProcess>()
@@ -89,7 +96,9 @@ process.on('SIGTERM', () => {
 
 async function start(lakeDest: string, dataset: string, report: (state: DatasetState) => void): Promise<LiveView> {
   const store = openStore(lakeDest, dataset)
-  if (!(await readCoverage(store))?.value.complete) report('backfilling')
+  const coverage = (await readCoverage(store))?.value
+  if (!coverage?.complete) report('backfilling')
+  else if (missingContracts(loadConfig(dataset), coverage).length) report('absorbing')
   await bootstrap(store, loadConfig(dataset), (script) => runScript(script, dataset), logger.child(dataset))
   return follow(lakeDest, store, dataset)
 }
