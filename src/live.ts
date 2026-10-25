@@ -2,7 +2,8 @@ import { ChildProcess, spawn } from 'child_process'
 import { join } from 'path'
 import { run } from '@subsquid/batch-processor'
 import { createLogger } from '@subsquid/logger'
-import { datasetsFromEnv, loadConfig, required } from './config'
+import { DatasetConfig, datasetsFromEnv, loadConfig, required } from './config'
+import { missingContracts } from './absorb'
 import { bootstrap } from './bootstrap'
 import { readCoverage } from './coverage'
 import { openRegistry } from './discover'
@@ -59,12 +60,18 @@ async function main() {
     },
     // Ready once every dataset that was already complete is served again, so a deployment keeps the
     // task it replaces until then. A first backfill takes hours and does not hold the task back: the
-    // portal had nothing to serve for that dataset before either.
+    // portal had nothing to serve for that dataset before either. A dataset absorbing new contracts is
+    // served meanwhile, as its lake stood (see `start`).
     () => ({ ready: ![...states.values()].includes('starting'), datasets: Object.fromEntries(states) })
   ).listen(port, () => logger.info(`portal listening on ${port} for ${datasets.join(', ')}`))
 
   for (const dataset of datasets) {
-    start(lakeDest, dataset, (state) => states.set(dataset, state)).then(
+    start(
+      lakeDest,
+      dataset,
+      (state) => states.set(dataset, state),
+      (view) => views.set(dataset, view)
+    ).then(
       (view) => {
         views.set(dataset, view)
         states.set(dataset, 'ready')
@@ -77,8 +84,13 @@ async function main() {
   }
 }
 
-/** `starting`: complete, and about to be served; `backfilling`: filling up from the SQD portal. */
-type DatasetState = 'starting' | 'backfilling' | 'ready'
+/**
+ * `starting`: complete, and about to be served; `backfilling`: filling up from the SQD portal;
+ * `absorbing`: taking in the history of contracts its config gained, over RPC, and served meanwhile as
+ * its lake stood. Neither of the last two holds the task back: they take longer than a health check
+ * waits, and a task killed meanwhile would start them over.
+ */
+type DatasetState = 'starting' | 'backfilling' | 'absorbing' | 'ready'
 
 /** The commands this process runs, stopped with it. */
 const children = new Set<ChildProcess>()
@@ -87,11 +99,30 @@ process.on('SIGTERM', () => {
   process.exit(143)
 })
 
-async function start(lakeDest: string, dataset: string, report: (state: DatasetState) => void): Promise<LiveView> {
+async function start(lakeDest: string, dataset: string, report: (state: DatasetState) => void, serve: (view: LiveView) => void): Promise<LiveView> {
   const store = openStore(lakeDest, dataset)
-  if (!(await readCoverage(store))?.value.complete) report('backfilling')
-  await bootstrap(store, loadConfig(dataset), (script) => runScript(script, dataset), logger.child(dataset))
-  return follow(lakeDest, store, dataset)
+  const config = loadConfig(dataset)
+  const coverage = (await readCoverage(store))?.value
+  if (!coverage?.complete) {
+    report('backfilling')
+  } else if (!coverage.partial && missingContracts(config, coverage).length) {
+    // The lake is served as it stands while the new contracts are absorbed, without new blocks: the
+    // task a deployment replaces stops once this one is ready, and its other contracts' consumers then
+    // wait for new blocks rather than get 503s. The new contracts' history is served once absorbed.
+    serve(await asItStands(lakeDest, store, dataset))
+    report('absorbing')
+  }
+  await bootstrap(store, config, (script) => runScript(script, dataset), logger.child(dataset))
+  return follow(lakeDest, store, dataset, config)
+}
+
+/** A complete lake served as its manifest stands, with no follower. */
+async function asItStands(lakeDest: string, store: Store, dataset: string): Promise<LiveView> {
+  const manifest = await store.read<Manifest>(MANIFEST_FILE)
+  if (!manifest) throw new Error(`${dataset} has no lake to serve`)
+  const lake = await LakeDataset.open(lakeDest, dataset)
+  await lake.check()
+  return new LiveView(lake, new Tail({ height: manifest.value.height, hash: manifest.value.hash }))
 }
 
 /** Runs one of this package's commands for a dataset, in a process of its own: they exit when done. */
@@ -111,9 +142,8 @@ function runScript(script: string, dataset: string): Promise<void> {
 }
 
 /** Starts following one dataset, and returns what the portal serves of it. */
-async function follow(lakeDest: string, store: Store, dataset: string): Promise<LiveView> {
+async function follow(lakeDest: string, store: Store, dataset: string, config: DatasetConfig): Promise<LiveView> {
   const log = logger.child(dataset)
-  const config = loadConfig(dataset)
   const rpc = new RpcClient(rpcUrl(dataset))
 
   // The lake's state first, then the registry: a contract is saved before any block that needs it is

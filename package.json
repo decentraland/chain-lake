@@ -11,6 +11,7 @@
     "test": "npm run build && node --test \"lib/**/*.test.js\"",
     "discover": "node lib/discover.js",
     "backfill": "node lib/backfill.js",
+    "absorb": "node lib/absorb.js",
     "follow": "node lib/follow.js",
     "serve": "node lib/serve.js",
     "live": "node lib/live.js",
