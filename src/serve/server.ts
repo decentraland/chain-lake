@@ -51,15 +51,31 @@ export interface Health {
   datasets: Record<string, string>
 }
 
+export interface PortalOptions {
+  /**
+   * How long a stream request past the head is held, waiting for a new block, before its 204. A squid
+   * asks again as soon as it gets a 204, and records its head in the database on every answer, so
+   * without the wait a squid at the head makes a database commit per round trip, tens a second,
+   * instead of one per block. The SQD portal holds such requests too.
+   */
+  headWaitMs?: number
+  /** How often the head is looked at while a request is held. */
+  headPollMs?: number
+}
+
+const HEAD_WAIT_MS = 5000
+const HEAD_POLL_MS = 200
+
 /** `health`, when given, is served at `GET /health`: 200 when ready, 503 otherwise, with each dataset's state. */
-export function createPortal(view: Views, health?: () => Health) {
+export function createPortal(view: Views, health?: () => Health, options: PortalOptions = {}) {
+  const wait = { ms: options.headWaitMs ?? HEAD_WAIT_MS, pollMs: options.headPollMs ?? HEAD_POLL_MS }
   return createServer(async (req, res) => {
     try {
       if (health && req.url === '/health') {
         const { ready, datasets } = health()
         return send(res, ready ? 200 : 503, datasets)
       }
-      await answer(view, req, res)
+      await answer(view, req, res, wait)
     } catch (e) {
       if (res.headersSent) {
         // Part of the answer is out: cut the connection, so the client sees a failed request and retries.
@@ -76,7 +92,7 @@ export function createPortal(view: Views, health?: () => Health) {
   })
 }
 
-async function answer(view: Views, req: IncomingMessage, res: ServerResponse) {
+async function answer(view: Views, req: IncomingMessage, res: ServerResponse, wait: { ms: number; pollMs: number }) {
   const match = req.url?.match(/^\/datasets\/([^/]+)\/(stream|finalized-stream|head|finalized-head)\/?$/)
   if (!match) return send(res, 404, { error: 'not found' })
   const [, name, endpoint] = match
@@ -119,8 +135,24 @@ async function answer(view: Views, req: IncomingMessage, res: ServerResponse) {
 
   // The heads are read after every wait above: the follower keeps moving meanwhile.
   let finalized = await chain.head()
-  const latest = latestOf(chain, finalized)
-  const to = Math.min(query.toBlock ?? Infinity, (hot ? latest : finalized).number)
+  let latest = latestOf(chain, finalized)
+  const upTo = () => Math.min(query.toBlock ?? Infinity, (hot ? latest : finalized).number)
+  let to = upTo()
+  // Past the head, the request is held until a block comes, a while at most, or the client goes away.
+  // Not past the client's own toBlock: no block will ever come for it.
+  if (query.fromBlock > to && (query.toBlock === undefined || query.fromBlock <= query.toBlock)) {
+    let gone = false
+    res.once('close', () => (gone = true))
+    const deadline = Date.now() + wait.ms
+    while (query.fromBlock > to && !gone && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(wait.pollMs, Math.max(0, deadline - Date.now()))))
+      finalized = await chain.head()
+      latest = latestOf(chain, finalized)
+      to = upTo()
+    }
+    if (gone) return
+    if (query.fromBlock <= to && (await forked())) return answerFork()
+  }
   if (query.fromBlock > to) {
     res.writeHead(204, headHeaders(finalized, latest))
     return res.end()
