@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { AddressInfo } from 'net'
 import { Page } from './lake'
 import { Upstream } from './headers'
-import { blockLines, ChainView, createPortal, NotReady } from './server'
+import { blockLines, ChainView, createPortal, NotReady, PortalOptions } from './server'
 import { BadQuery, logCondition, MAX_LIST, MAX_LOG_REQUESTS, parseQuery } from './query'
 
 const ADDRESS = '0x1c436c1efb4608dffdc8bace99d2b03c314f3348'
@@ -73,8 +73,8 @@ test('blocks carry the requested fields, transactions before logs, and end with 
 })
 
 /** A portal over one dataset, on a free port, for the duration of `f`. */
-async function withPortal(chain: ChainView, f: (url: string) => Promise<void>) {
-  const server = createPortal((dataset) => (dataset === 'polygon-mainnet' ? Promise.resolve(chain) : undefined))
+async function withPortal(chain: ChainView, f: (url: string) => Promise<void>, options: PortalOptions = { headWaitMs: 100, headPollMs: 10 }) {
+  const server = createPortal((dataset) => (dataset === 'polygon-mainnet' ? Promise.resolve(chain) : undefined), undefined, options)
   await new Promise<void>((resolve) => server.listen(0, resolve))
   try {
     await f(`http://localhost:${(server.address() as AddressInfo).port}/datasets/polygon-mainnet`)
@@ -231,4 +231,53 @@ test('finalized-stream checks the parent block too', async () => {
     const res = await fetch(`${url}/finalized-stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 51, parentBlockHash: '0x' + 'dd'.repeat(32) }) })
     assert.equal(res.status, 409)
   })
+})
+
+test('a request past the head is held until a block comes, and answered with it, not with a 204 at once', async () => {
+  let head = 100
+  const asked: [number, number][] = []
+  const chain: ChainView = {
+    head: async () => ({ number: head, hash: `0x${head}` }),
+    page: async (_q, from, to) => (asked.push([from, to]), emptyPage(to)),
+  }
+  setTimeout(() => (head = 101), 50)
+  await withPortal(
+    chain,
+    async (url) => {
+      const res = await fetch(`${url}/finalized-stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 101 }) })
+      assert.equal(res.status, 200)
+      await res.text()
+      assert.deepEqual(asked, [[101, 101]])
+    },
+    { headWaitMs: 2000, headPollMs: 10 }
+  )
+})
+
+test('a request past the head gets its 204 once no block came for a while, so a squid at the head does not ask in a loop', async () => {
+  const chain: ChainView = { head: async () => ({ number: 100, hash: '0x100' }), page: async (_q, _from, to) => emptyPage(to) }
+  await withPortal(
+    chain,
+    async (url) => {
+      const started = Date.now()
+      const res = await fetch(`${url}/finalized-stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 101 }) })
+      assert.equal(res.status, 204)
+      assert.equal(res.headers.get('x-sqd-finalized-head-number'), '100')
+      assert.ok(Date.now() - started >= 140, 'held for the wait')
+    },
+    { headWaitMs: 150, headPollMs: 10 }
+  )
+})
+
+test('a request past its own toBlock gets its 204 at once: no block will come for it', async () => {
+  const chain: ChainView = { head: async () => ({ number: 100, hash: '0x100' }), page: async (_q, _from, to) => emptyPage(to) }
+  await withPortal(
+    chain,
+    async (url) => {
+      const started = Date.now()
+      const res = await fetch(`${url}/finalized-stream`, { method: 'POST', body: JSON.stringify({ ...base, fromBlock: 101, toBlock: 100 }) })
+      assert.equal(res.status, 204)
+      assert.ok(Date.now() - started < 1000)
+    },
+    { headWaitMs: 5000, headPollMs: 10 }
+  )
 })
