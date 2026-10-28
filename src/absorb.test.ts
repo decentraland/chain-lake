@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, readdirSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { test, TestContext } from 'node:test'
@@ -161,6 +161,35 @@ test('reading several ranges at once absorbs the same history', async (t) => {
   assert.deepEqual((await logsOf(lakeDir, CHILD)).blocks, [20, 35, 45])
   assert.deepEqual((await logsOf(lakeDir, FACTORY)).blocks, [15])
   assert.deepEqual((await store.read<Registry>(REGISTRY_FILE))!.value.contracts.map((c) => c.address), [OLD, FACTORY, CHILD])
+})
+
+/** A contract added on its own, deployed at block 18: before it, the chain holds nothing of it. */
+const deployed: DatasetConfig = { ...before, contracts: [...before.contracts, { name: 'Store', address: CHILD, fromBlock: 18 }] }
+
+test('a contract with a fromBlock is read from that block, not from the start of the dataset', async (t) => {
+  const { lakeDir, store } = await lake(t)
+  const from: number[] = []
+  await absorb({ lakeDest: lakeDir, config: deployed, store, fetch: async (...args) => (from.push(args[2]), rpc(...args)), maxRange: 7 })
+  assert.equal(Math.min(...from), 18)
+  assert.deepEqual((await logsOf(lakeDir, CHILD)).blocks, [20, 35, 45])
+})
+
+test('each chunk is written as soon as all its blocks are read, before the blocks past it', async (t) => {
+  const { lakeDir, store } = await lake(t)
+  const chunksDir = join(lakeDir, DATASET, 'chunks')
+  const before = new Set(readdirSync(chunksDir))
+  // Whether the chunk of blocks 0-20 has been written again, with block 20's new log.
+  const firstRewritten = () => readdirSync(chunksDir).some((d) => !before.has(d) && d.startsWith('0000000000-0000000020-'))
+  const seen: [number, boolean][] = []
+  const watching: FetchHistory = async (...args) => (seen.push([args[2], firstRewritten()]), rpc(...args))
+  await absorb({ lakeDest: lakeDir, config: deployed, store, fetch: watching, maxRange: 7 })
+  // Ranges 18-24 and 25-31: the first ends past the chunk, which is then written before the second is read.
+  assert.deepEqual(seen.slice(0, 2), [
+    [18, false],
+    [25, true],
+  ])
+  assert.deepEqual((await logsOf(lakeDir, CHILD)).blocks, [20, 35, 45])
+  assert.deepEqual((await logsOf(lakeDir, OLD)).blocks, [10, 20, 30])
 })
 
 test("a factory moved to an earlier block is absorbed again from there, with the children it created before", async (t) => {

@@ -4,6 +4,8 @@ import { join } from 'path'
 export interface Contract {
   name: string
   address: string
+  /** The block it was deployed at, where `absorb` starts reading it; the dataset's `fromBlock` if unset. */
+  fromBlock?: number
 }
 
 /** A contract that creates others; the address of each new one is read from a log topic. */
@@ -29,6 +31,7 @@ export function loadConfig(dataset = required('DATASET')): DatasetConfig {
   const config = JSON.parse(readFileSync(file, 'utf8')) as DatasetConfig
   for (const c of [...config.contracts, ...config.factories]) {
     if (!/^0x[0-9a-f]{40}$/.test(c.address)) throw new Error(`${c.name}: ${c.address} is not a lowercase address`)
+    if (c.fromBlock !== undefined && !(Number.isSafeInteger(c.fromBlock) && c.fromBlock >= 0)) throw new Error(`${c.name}: fromBlock must be a block number`)
   }
   for (const f of config.factories) {
     if (f.childName !== undefined && (typeof f.childName !== 'string' || !f.childName)) throw new Error(`${f.name}: childName must be a non-empty string`)

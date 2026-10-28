@@ -66,10 +66,13 @@ A contract or factory added to the config of a complete lake is absorbed before 
 again, and so is a factory whose `fromBlock` moved earlier: `coverage.json` records the block each
 factory is held from. `absorb` reads the history over RPC, from the first block that can hold it up
 to the lake's height: first the contracts the new factories created, then the logs of all of them,
-several ranges at once. RPC trouble is waited out for as long as it lasts, as the follower does. It
-merges each block into the chunk that covers it (blocks in a gap between chunks get a chunk of their
-own), writes each changed chunk to a new folder, and moves the lake to them with one manifest write,
-so the portal serves the lake before or after, never in between. A run that stops halfway is run
+several ranges at once. A contract with a `fromBlock` (the block it was deployed at) is read from
+there; one without it, from the dataset's `fromBlock`. RPC trouble is waited out for as long as it
+lasts, as the follower does. It merges each block into the chunk that covers it (blocks in a gap
+between chunks get a chunk of their own) and writes each changed chunk to a new folder as soon as all
+its blocks are read, so memory holds the new history of a few chunks, not all of it. It moves the
+lake to the new folders with one manifest write, so the portal serves the lake before or after, never
+in between. A run that stops halfway is run
 again: merging the same history twice changes nothing. Absorbing is meant for contracts with little
 history next to the lake's: the history goes into the chunks it falls in, whatever their size.
 

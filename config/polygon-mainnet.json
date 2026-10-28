@@ -12,7 +12,8 @@
     },
     {
       "name": "CollectionStore",
-      "address": "0x214ffc0f0103735728dc66b61a22e4f163e275ae"
+      "address": "0x214ffc0f0103735728dc66b61a22e4f163e275ae",
+      "fromBlock": 15202567
     },
     {
       "name": "BidV2",
