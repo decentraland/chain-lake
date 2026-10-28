@@ -192,6 +192,28 @@ test('each chunk is written as soon as all its blocks are read, before the block
   assert.deepEqual((await logsOf(lakeDir, OLD)).blocks, [10, 20, 30])
 })
 
+test('the history read is staged on disk as each range arrives, and removed once its chunk is written', async (t) => {
+  const { lakeDir, store } = await lake(t)
+  const workDir = mkdtempSync(join(tmpdir(), 'chain-lake-work-'))
+  t.after(() => rmSync(workDir, { recursive: true, force: true }))
+  const staged = () => readdirSync(join(workDir, 'staged')).filter((f) => f.endsWith('.logs.json')).map((f) => f.split('.')[0])
+  const seen: [number, string[]][] = []
+  const watching: FetchHistory = async (...args) => (seen.push([args[2], staged()]), rpc(...args))
+  await absorb({ lakeDest: lakeDir, config: deployed, store, fetch: watching, maxRange: 7, workDir })
+  assert.deepEqual(seen, [
+    [18, []],
+    // Block 20's chunk (0-20) is written once range 18-24 is read, and its staged range removed.
+    [25, []],
+    [32, []],
+    // Block 35 waits on disk for the rest of its chunk (21-40), a wide one it shares with older history.
+    [39, ['0000000032-0000000038']],
+    // Block 45, past every chunk, waits on disk for the end, when its gap gets a chunk of its own.
+    [46, ['0000000039-0000000045']],
+  ])
+  assert.deepEqual((await logsOf(lakeDir, CHILD)).blocks, [20, 35, 45])
+  assert.deepEqual((await store.read<Manifest>(MANIFEST_FILE))!.value.chunks.map((c) => [c.from, c.to]), [[0, 20], [21, 40], [45, 45]])
+})
+
 test("a factory moved to an earlier block is absorbed again from there, with the children it created before", async (t) => {
   const { lakeDir, store } = await lake(t)
   await absorb({ lakeDest: lakeDir, config: after, store, fetch: rpc, maxRange: 7 })

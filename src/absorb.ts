@@ -1,5 +1,5 @@
 import { randomBytes } from 'crypto'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
@@ -63,6 +63,8 @@ export async function absorb(options: {
   concurrency?: number
   log?: Logger
   maxAttempts?: number
+  /** Where the new history is staged and DuckDB spills; a new temporary directory by default, removed after. */
+  workDir?: string
 }): Promise<void> {
   const { lakeDest, config, store, fetch, maxRange } = options
   const concurrency = Math.max(1, options.concurrency ?? 1)
@@ -81,38 +83,43 @@ export async function absorb(options: {
   log.info(`absorbing ${missing.map((c) => c.name).join(', ')} from block ${start}, over RPC`)
 
   const created = new Map<string, RegisteredContract>()
-  // Only the blocks of chunks not yet written: a chunk is written as soon as all its blocks are read.
-  const blocks = new Map<number, LakeBlock>()
+  const work = options.workDir ?? mkdtempSync(join(tmpdir(), 'chain-lake-absorb-'))
+  const removeWork = () => options.workDir || rmSync(work, { recursive: true, force: true })
+  // The new history goes to disk as it is read; memory keeps only the numbers of its blocks.
+  const staging = new Staging(join(work, 'staged'))
   let fetchedTo = start - 1
   let absorbed = 0
   const writer = randomBytes(16).toString('hex')
   // The chunks written while reading, by the folder of the chunk each replaces.
   const replaced = new Map<string, Chunk>()
   const written = new Map<string, Chunk>()
-  const chunks = await ChunkFiles.open(lakeDest, config.dataset)
+  const chunks = await ChunkFiles.open(lakeDest, config.dataset, join(work, 'duckdb')).catch((e) => {
+    removeWork()
+    throw e
+  })
 
   /** A new folder for `chunk`, named by its range and this run. */
   const folder = (chunk: Chunk): Chunk => ({ ...chunk, dir: `${pad(chunk.from)}-${pad(chunk.to)}-${writer}` })
 
   /**
-   * Writes every chunk of `existing` that ends by `upTo` and takes new history, and drops its blocks from
-   * memory. The lake does not list the new folders until the manifest is written, at the end.
+   * Writes every chunk of `existing` that ends by `upTo` and takes new history, and drops its staged
+   * history. The lake does not list the new folders until the manifest is written, at the end.
    */
   async function flush(existing: Chunk[], upTo: number): Promise<void> {
-    for (const target of planChunks(existing, [...blocks.keys()])) {
+    for (const target of planChunks(existing, staging.numbers())) {
       if (!target.original || target.blocks.length === 0 || target.original.to > upTo) continue
       const chunk = folder(target.chunk)
-      await chunks.write(chunk, target.original, target.blocks.map((n) => blocks.get(n)!))
+      await chunks.write(chunk, target.original, staging.files(chunk.from, chunk.to))
       replaced.set(target.original.dir, chunk)
-      for (const n of target.blocks) blocks.delete(n)
+      staging.drop(chunk.from, chunk.to)
     }
   }
 
   /**
    * Reads the new history of [from, to]: first the contracts the new factories created there, then the
    * logs of all of them. Knowing every contract before reading any logs lets the ranges be read at once.
-   * The logs are read a few ranges at a time, in block order, and each chunk of `existing` is written once
-   * all of it is read, so memory holds the history of a few chunks, never the whole of it.
+   * The logs are read a few ranges at a time, in block order, and staged on disk as each range arrives;
+   * each chunk of `existing` is written once all of it is read, and its staged history then removed.
    */
   async function read(from: number, to: number, existing: Chunk[]): Promise<void> {
     const ranges: [number, number][] = []
@@ -133,11 +140,7 @@ export async function absorb(options: {
         const range = await fetch(followed, factories, a, b)
         const unknown = range.created.find((c) => !followed.has(c.address))
         if (unknown) throw new Error(`${config.dataset}: block ${unknown.createdAt?.block} creates ${unknown.address}, which reading the creations did not find`)
-        for (const block of range.blocks) {
-          if (block.logs.length === 0 || blocks.has(block.header.number)) continue
-          blocks.set(block.header.number, block)
-          absorbed++
-        }
+        absorbed += staging.add(a, b, range.blocks)
         if (++fetches % 100 === 0) log.info(`read ${fetches} of ${ranges.length} ranges: ${absorbed} blocks with logs`)
       })
       await flush(existing, group[group.length - 1][1])
@@ -158,8 +161,8 @@ export async function absorb(options: {
         fetchedTo = manifest.value.height
       }
 
-      // What is still in memory: chunks a follower added past the height read first, and the gaps.
-      const plan = planChunks(manifest.value.chunks, [...blocks.keys()])
+      // What is still staged: chunks a follower added past the height read first, and the gaps.
+      const plan = planChunks(manifest.value.chunks, staging.numbers())
       const next: Chunk[] = []
       for (const target of plan) {
         const done = target.original && replaced.get(target.original.dir)
@@ -172,7 +175,7 @@ export async function absorb(options: {
         let chunk = written.get(key)
         if (!chunk) {
           chunk = folder(target.chunk)
-          await chunks.write(chunk, target.original, target.blocks.map((n) => blocks.get(n)!))
+          await chunks.write(chunk, target.original, staging.files(chunk.from, chunk.to))
           written.set(key, chunk)
         }
         next.push(chunk)
@@ -195,7 +198,11 @@ export async function absorb(options: {
     }
     throw new Error(`${config.dataset}: the lake kept moving while absorbing; run it again`)
   } finally {
-    chunks.close()
+    try {
+      chunks.close()
+    } finally {
+      removeWork()
+    }
   }
 }
 
@@ -279,71 +286,122 @@ function jsonColumns(schema: TableSchema): string {
   return `{${entries.join(', ')}}`
 }
 
+/** The staged rows of each lake table, in files that cover a block range. */
+type StagedFiles = Record<keyof typeof columns, string[]>
+
+/**
+ * New history staged on disk, one set of newline-delimited JSON files per range read, written row by row.
+ * Memory keeps the numbers of the blocks still to write, never the blocks.
+ */
+export class Staging {
+  private readonly ranges: { from: number; to: number; prefix: string; numbers: number[] }[] = []
+
+  constructor(private readonly dir: string) {
+    mkdirSync(dir, { recursive: true })
+  }
+
+  /** Stages the blocks of [from, to] that hold logs, and returns how many there were. */
+  add(from: number, to: number, blocks: LakeBlock[]): number {
+    const held = blocks.filter((b) => b.logs.length > 0)
+    if (held.length === 0) return 0
+    const prefix = join(this.dir, `${pad(from)}-${pad(to)}`)
+    const fds = { blocks: openSync(`${prefix}.blocks.json`, 'w'), logs: openSync(`${prefix}.logs.json`, 'w'), transactions: openSync(`${prefix}.transactions.json`, 'w') }
+    try {
+      const lines = (fd: number) => ({ write: (row: Record<string, unknown>) => void writeSync(fd, JSON.stringify(row) + '\n') })
+      writeBlocks({ blocks: lines(fds.blocks), logs: lines(fds.logs), transactions: lines(fds.transactions) }, held)
+    } finally {
+      for (const fd of Object.values(fds)) closeSync(fd)
+    }
+    this.ranges.push({ from, to, prefix, numbers: held.map((b) => b.header.number).sort((x, y) => x - y) })
+    this.ranges.sort((x, y) => x.from - y.from)
+    return held.length
+  }
+
+  /** The numbers of the staged blocks, in chain order. */
+  numbers(): number[] {
+    return this.ranges.flatMap((r) => r.numbers)
+  }
+
+  /** The files that hold the staged blocks of [from, to], with others outside it that a reader filters out. */
+  files(from: number, to: number): StagedFiles {
+    const prefixes = this.overlapping(from, to).map((r) => r.prefix)
+    return { blocks: prefixes.map((p) => `${p}.blocks.json`), logs: prefixes.map((p) => `${p}.logs.json`), transactions: prefixes.map((p) => `${p}.transactions.json`) }
+  }
+
+  /** Forgets the staged blocks of [from, to], once written, and removes the files left with none. */
+  drop(from: number, to: number): void {
+    for (const range of this.overlapping(from, to)) {
+      range.numbers = range.numbers.filter((n) => n < from || n > to)
+      if (range.numbers.length) continue
+      for (const table of ['blocks', 'logs', 'transactions']) rmSync(`${range.prefix}.${table}.json`, { force: true })
+      this.ranges.splice(this.ranges.indexOf(range), 1)
+    }
+  }
+
+  private overlapping(from: number, to: number) {
+    return this.ranges.filter((r) => r.numbers.length && r.numbers[0] <= to && r.numbers[r.numbers.length - 1] >= from)
+  }
+}
+
 /** The chunk files of a dataset, read and written with DuckDB, in a local directory or on S3. */
 class ChunkFiles {
   private constructor(
     private readonly instance: DuckDBInstance,
     private readonly db: DuckDBConnection,
-    private readonly base: string,
-    private readonly temp: string
+    private readonly base: string
   ) {}
 
-  static async open(lakeDest: string, dataset: string): Promise<ChunkFiles> {
-    const instance = await DuckDBInstance.create(':memory:', { memory_limit: process.env.DUCKDB_MEMORY_LIMIT || '1GB' })
+  static async open(lakeDest: string, dataset: string, spill: string): Promise<ChunkFiles> {
+    // It runs beside the portal, in the same task: a limit of its own, small since it writes one chunk at
+    // a time, one thread on a one-CPU task, and a bounded spill directory past it.
+    const instance = await DuckDBInstance.create(':memory:', {
+      memory_limit: process.env.ABSORB_DUCKDB_MEMORY_LIMIT || '256MB',
+      threads: '1',
+      // The COPY orders its rows itself.
+      preserve_insertion_order: 'false',
+      temp_directory: spill,
+      max_temp_directory_size: process.env.ABSORB_DUCKDB_MAX_TEMP || '4GB',
+    })
     const db = await instance.connect()
-    const base = `${lakeDest.replace(/\/$/, '')}/${dataset}/chunks`
-    if (base.startsWith('s3://')) {
-      await db.run('INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;')
-      const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
-      await db.run(`CREATE SECRET lake (TYPE s3, PROVIDER credential_chain, REFRESH auto${region ? `, REGION '${region}'` : ''})`)
+    const files = new ChunkFiles(instance, db, `${lakeDest.replace(/\/$/, '')}/${dataset}/chunks`)
+    try {
+      if (files.base.startsWith('s3://')) {
+        await db.run('INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;')
+        const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
+        await db.run(`CREATE SECRET lake (TYPE s3, PROVIDER credential_chain, REFRESH auto${region ? `, REGION '${region}'` : ''})`)
+      }
+      return files
+    } catch (e) {
+      files.close()
+      throw e
     }
-    return new ChunkFiles(instance, db, base, mkdtempSync(join(tmpdir(), 'chain-lake-absorb-')))
   }
 
-  /** Writes `chunk`: the rows of `original`, if any, and those of `blocks`, without repeats, in chain order. */
-  async write(chunk: Chunk, original: Chunk | undefined, blocks: LakeBlock[]): Promise<void> {
-    const rows = toRows(blocks)
-    const staged = (name: string, lines: object[]) => {
-      const file = join(this.temp, `${name}.json`)
-      writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n')
-      return file
-    }
-    const files = {
-      blocks: staged('blocks', rows.blocks),
-      logs: staged('logs', rows.logs),
-      transactions: staged('transactions', rows.transactions),
-    }
+  /** Writes `chunk`: the rows of `original`, if any, and the staged ones in its range, without repeats, in chain order. */
+  async write(chunk: Chunk, original: Chunk | undefined, staged: StagedFiles): Promise<void> {
     const dir = `${this.base}/${chunk.dir}`
     if (!dir.startsWith('s3://')) mkdirSync(dir, { recursive: true })
     // By name, not by position, and in the follower's column order.
     const old = (table: string) => (original ? `SELECT * FROM read_parquet('${this.base}/${original.dir}/${table}.parquet') UNION ALL BY NAME ` : '')
-    const copy = async (table: keyof typeof columns, key: string, file: string) => {
+    const copy = async (table: keyof typeof columns, number: string, key: string) => {
       const schema = columns[table]
       const names = Object.keys(schema).map((n) => `"${n}"`).join(', ')
-      const json = `SELECT * FROM read_json('${file}', format = 'newline_delimited', columns = ${jsonColumns(schema)})`
+      const files = staged[table].map((f) => `'${f}'`).join(', ')
+      const json = `SELECT * FROM read_json([${files}], format = 'newline_delimited', columns = ${jsonColumns(schema)}) WHERE ${number} BETWEEN ${chunk.from} AND ${chunk.to}`
       await this.db.run(
         `COPY (SELECT ${names} FROM (${old(table)}${json}) QUALIFY row_number() OVER (PARTITION BY ${key}) = 1 ORDER BY ${key})
          TO '${dir}/${table}.parquet' (FORMAT PARQUET, COMPRESSION GZIP)`
       )
     }
-    await copy('blocks', 'number', files.blocks)
-    await copy('logs', 'block_number, log_index', files.logs)
-    await copy('transactions', 'block_number, transaction_index', files.transactions)
+    await copy('blocks', 'number', 'number')
+    await copy('logs', 'block_number', 'block_number, log_index')
+    await copy('transactions', 'block_number', 'block_number, transaction_index')
   }
 
   close(): void {
     this.db.closeSync()
     this.instance.closeSync()
-    rmSync(this.temp, { recursive: true, force: true })
   }
-}
-
-/** The rows of the lake's tables for these blocks, written by `writeBlocks`, as the follower writes them. */
-function toRows(blocks: LakeBlock[]) {
-  const rows = { blocks: [] as object[], logs: [] as object[], transactions: [] as object[] }
-  const collect = (into: object[]) => ({ write: (row: Record<string, unknown>) => into.push(row) })
-  writeBlocks({ blocks: collect(rows.blocks), logs: collect(rows.logs), transactions: collect(rows.transactions) }, blocks)
-  return rows
 }
 
 async function main() {
