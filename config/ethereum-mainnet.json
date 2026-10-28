@@ -19,6 +19,10 @@
       "address": "0x8e5660b4ab70168b5a6feea0e0315cb49c8cd539"
     },
     {
+      "name": "LegacyMarketplace",
+      "address": "0xb3bca6f5052c7e24726b44da7403b56a8a1b98f8"
+    },
+    {
       "name": "ERC721Bid",
       "address": "0xe479dfd9664c693b2e2992300930b00bfde08233"
     },
