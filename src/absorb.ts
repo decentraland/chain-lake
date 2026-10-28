@@ -42,8 +42,9 @@ export function missingContracts(config: DatasetConfig, coverage: Coverage): Reg
  *
  * Their history is read over RPC, from the first block that can hold it up to the lake's height, and
  * merged into the chunks that cover each block; blocks no chunk covers get chunks of their own, in
- * the gaps. Each changed chunk is written to a new folder, and the lake moves to it only when the
- * manifest listing it is written, by compare-and-swap, so readers see the lake before or after, never
+ * the gaps. Each changed chunk is written to a new folder as soon as all its blocks are read, so the
+ * history is never held in memory whole, and the lake moves to the new folders only when the manifest
+ * listing them is written, by compare-and-swap, so readers see the lake before or after, never
  * in between. The registry is written first, as the follower does, and the coverage last: a run that
  * stops halfway is run again, and merging the same history twice changes nothing.
  *
@@ -74,20 +75,46 @@ export async function absorb(options: {
 
   const missingAddresses = new Set(missing.map((c) => c.address))
   const factories = config.factories.filter((f) => missingAddresses.has(f.address))
-  const start = Math.min(...missing.map((c) => factories.find((f) => f.address === c.address)?.fromBlock ?? config.fromBlock))
+  const fromBlockOf = (address: string) =>
+    factories.find((f) => f.address === address)?.fromBlock ?? config.contracts.find((c) => c.address === address)?.fromBlock ?? config.fromBlock
+  const start = Math.min(...missing.map((c) => fromBlockOf(c.address)))
   log.info(`absorbing ${missing.map((c) => c.name).join(', ')} from block ${start}, over RPC`)
 
   const created = new Map<string, RegisteredContract>()
+  // Only the blocks of chunks not yet written: a chunk is written as soon as all its blocks are read.
   const blocks = new Map<number, LakeBlock>()
   let fetchedTo = start - 1
+  let absorbed = 0
   const writer = randomBytes(16).toString('hex')
+  // The chunks written while reading, by the folder of the chunk each replaces.
+  const replaced = new Map<string, Chunk>()
   const written = new Map<string, Chunk>()
+  const chunks = await ChunkFiles.open(lakeDest, config.dataset)
+
+  /** A new folder for `chunk`, named by its range and this run. */
+  const folder = (chunk: Chunk): Chunk => ({ ...chunk, dir: `${pad(chunk.from)}-${pad(chunk.to)}-${writer}` })
+
+  /**
+   * Writes every chunk of `existing` that ends by `upTo` and takes new history, and drops its blocks from
+   * memory. The lake does not list the new folders until the manifest is written, at the end.
+   */
+  async function flush(existing: Chunk[], upTo: number): Promise<void> {
+    for (const target of planChunks(existing, [...blocks.keys()])) {
+      if (!target.original || target.blocks.length === 0 || target.original.to > upTo) continue
+      const chunk = folder(target.chunk)
+      await chunks.write(chunk, target.original, target.blocks.map((n) => blocks.get(n)!))
+      replaced.set(target.original.dir, chunk)
+      for (const n of target.blocks) blocks.delete(n)
+    }
+  }
 
   /**
    * Reads the new history of [from, to]: first the contracts the new factories created there, then the
    * logs of all of them. Knowing every contract before reading any logs lets the ranges be read at once.
+   * The logs are read a few ranges at a time, in block order, and each chunk of `existing` is written once
+   * all of it is read, so memory holds the history of a few chunks, never the whole of it.
    */
-  async function read(from: number, to: number): Promise<void> {
+  async function read(from: number, to: number, existing: Chunk[]): Promise<void> {
     const ranges: [number, number][] = []
     for (let a = from; a <= to; a += maxRange) ranges.push([a, Math.min(a + maxRange - 1, to)])
     if (factories.length) {
@@ -100,38 +127,51 @@ export async function absorb(options: {
     }
     const followed = new Set([...missingAddresses, ...created.keys()])
     let fetches = 0
-    await inParallel(ranges, concurrency, async ([a, b]) => {
-      const range = await fetch(followed, factories, a, b)
-      const unknown = range.created.find((c) => !followed.has(c.address))
-      if (unknown) throw new Error(`${config.dataset}: block ${unknown.createdAt?.block} creates ${unknown.address}, which reading the creations did not find`)
-      for (const block of range.blocks) if (block.logs.length > 0) blocks.set(block.header.number, block)
-      if (++fetches % 100 === 0) log.info(`read ${fetches} of ${ranges.length} ranges: ${blocks.size} blocks with logs`)
-    })
+    for (let i = 0; i < ranges.length; i += concurrency) {
+      const group = ranges.slice(i, i + concurrency)
+      await inParallel(group, concurrency, async ([a, b]) => {
+        const range = await fetch(followed, factories, a, b)
+        const unknown = range.created.find((c) => !followed.has(c.address))
+        if (unknown) throw new Error(`${config.dataset}: block ${unknown.createdAt?.block} creates ${unknown.address}, which reading the creations did not find`)
+        for (const block of range.blocks) {
+          if (block.logs.length === 0 || blocks.has(block.header.number)) continue
+          blocks.set(block.header.number, block)
+          absorbed++
+        }
+        if (++fetches % 100 === 0) log.info(`read ${fetches} of ${ranges.length} ranges: ${absorbed} blocks with logs`)
+      })
+      await flush(existing, group[group.length - 1][1])
+    }
   }
 
-  const chunks = await ChunkFiles.open(lakeDest, config.dataset)
   try {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const manifest = await store.read<Manifest>(MANIFEST_FILE)
       const registry = await store.read<Registry>(REGISTRY_FILE)
       if (!manifest || !registry) throw new Error(`${config.dataset}: the lake has no manifest or registry`)
+      // A follower only adds chunks past its height, so every chunk written while reading is still listed.
+      const listed = new Set(manifest.value.chunks.map((c) => c.dir))
+      const gone = [...replaced.keys()].find((dir) => !listed.has(dir))
+      if (gone) throw new Error(`${config.dataset}: chunk ${gone} left the lake while absorbing; run it again`)
       if (manifest.value.height > fetchedTo) {
-        await read(fetchedTo + 1, manifest.value.height)
+        await read(fetchedTo + 1, manifest.value.height, manifest.value.chunks)
         fetchedTo = manifest.value.height
       }
 
+      // What is still in memory: chunks a follower added past the height read first, and the gaps.
       const plan = planChunks(manifest.value.chunks, [...blocks.keys()])
       const next: Chunk[] = []
       for (const target of plan) {
-        if (target.blocks.length === 0) {
-          next.push(target.chunk)
+        const done = target.original && replaced.get(target.original.dir)
+        if (done || target.blocks.length === 0) {
+          next.push(done || target.chunk)
           continue
         }
         // A chunk already written on an earlier attempt, for the same blocks, is not written again.
         const key = `${target.original?.dir ?? 'gap'}:${target.chunk.from}-${target.chunk.to}:${target.blocks.length}`
         let chunk = written.get(key)
         if (!chunk) {
-          chunk = { ...target.chunk, dir: `${pad(target.chunk.from)}-${pad(target.chunk.to)}-${writer}` }
+          chunk = folder(target.chunk)
           await chunks.write(chunk, target.original, target.blocks.map((n) => blocks.get(n)!))
           written.set(key, chunk)
         }
@@ -150,7 +190,7 @@ export async function absorb(options: {
         continue
       }
       await recordCoverage(store, config, factories, missingAddresses, maxAttempts)
-      log.info(`absorbed ${missing.length} contracts and ${created.size} they created: ${blocks.size} blocks into ${written.size} chunks`)
+      log.info(`absorbed ${missing.length} contracts and ${created.size} they created: ${absorbed} blocks into ${replaced.size + written.size} chunks`)
       return
     }
     throw new Error(`${config.dataset}: the lake kept moving while absorbing; run it again`)

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'node:test'
-import { datasetsFromEnv } from './config'
+import { datasetsFromEnv, loadConfig } from './config'
 
 afterEach(() => {
   delete process.env.DATASETS
@@ -24,4 +24,9 @@ test('a dataset named twice, or none, is refused', () => {
   assert.throws(() => datasetsFromEnv(), /names no dataset/)
   delete process.env.DATASETS
   assert.throws(() => datasetsFromEnv(), /DATASETS is required/)
+})
+
+test('the collection store is absorbed from the block it was deployed at', () => {
+  const store = loadConfig('polygon-mainnet').contracts.find((c) => c.name === 'CollectionStore')
+  assert.equal(store?.fromBlock, 15202567)
 })
