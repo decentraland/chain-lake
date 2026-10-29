@@ -63,7 +63,7 @@ export async function absorb(options: {
   concurrency?: number
   log?: Logger
   maxAttempts?: number
-  /** Where the new history is staged and DuckDB spills; a new temporary directory by default, removed after. */
+  /** Where the new history is staged and DuckDB spills; a new temporary directory by default, removed after. A directory given here is the caller's to remove. */
   workDir?: string
 }): Promise<void> {
   const { lakeDest, config, store, fetch, maxRange } = options
@@ -84,7 +84,9 @@ export async function absorb(options: {
 
   const created = new Map<string, RegisteredContract>()
   const work = options.workDir ?? mkdtempSync(join(tmpdir(), 'chain-lake-absorb-'))
-  const removeWork = () => options.workDir || rmSync(work, { recursive: true, force: true })
+  const removeWork = () => {
+    if (!options.workDir) rmSync(work, { recursive: true, force: true })
+  }
   // The new history goes to disk as it is read; memory keeps only the numbers of its blocks.
   const staging = new Staging(join(work, 'staged'))
   let fetchedTo = start - 1
@@ -355,7 +357,8 @@ class ChunkFiles {
     // It runs beside the portal, in the same task: a limit of its own, small since it writes one chunk at
     // a time, one thread on a one-CPU task, and a bounded spill directory past it.
     const instance = await DuckDBInstance.create(':memory:', {
-      memory_limit: process.env.ABSORB_DUCKDB_MEMORY_LIMIT || '256MB',
+      // A chunk write allocates blocks of tens of MB at once that cannot spill: at 256MB it ran out on polygon.
+      memory_limit: process.env.ABSORB_DUCKDB_MEMORY_LIMIT || '768MB',
       threads: '1',
       // The COPY orders its rows itself.
       preserve_insertion_order: 'false',
@@ -386,7 +389,7 @@ class ChunkFiles {
     const copy = async (table: keyof typeof columns, number: string, key: string) => {
       const schema = columns[table]
       const names = Object.keys(schema).map((n) => `"${n}"`).join(', ')
-      const files = staged[table].map((f) => `'${f}'`).join(', ')
+      const files = staged[table].map((f) => `'${f.replace(/'/g, "''")}'`).join(', ')
       const json = `SELECT * FROM read_json([${files}], format = 'newline_delimited', columns = ${jsonColumns(schema)}) WHERE ${number} BETWEEN ${chunk.from} AND ${chunk.to}`
       await this.db.run(
         `COPY (SELECT ${names} FROM (${old(table)}${json}) QUALIFY row_number() OVER (PARTITION BY ${key}) = 1 ORDER BY ${key})

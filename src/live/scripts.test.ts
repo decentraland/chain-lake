@@ -6,6 +6,7 @@ test('absorb runs with a bounded heap, and the other commands as they are', () =
   assert.deepEqual(scriptArgs('absorb.js', {}), ['--max-old-space-size=768'])
   assert.deepEqual(scriptArgs('absorb.js', { ABSORB_HEAP_MB: '512' }), ['--max-old-space-size=512'])
   assert.deepEqual(scriptArgs('backfill.js', {}), [])
+  assert.throws(() => scriptArgs('absorb.js', { ABSORB_HEAP_MB: '768MB' }), /ABSORB_HEAP_MB must be a number of megabytes/)
 })
 
 test('runs of one queue never overlap, and a failed run does not stop the next', async () => {
