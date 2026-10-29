@@ -3,7 +3,10 @@
  * bounded: it stages the history it reads on disk, and holds only the ranges being read.
  */
 export function scriptArgs(script: string, env: NodeJS.ProcessEnv): string[] {
-  return script === 'absorb.js' ? [`--max-old-space-size=${Number(env.ABSORB_HEAP_MB || 768)}`] : []
+  if (script !== 'absorb.js') return []
+  const heap = Number(env.ABSORB_HEAP_MB || 768)
+  if (!Number.isSafeInteger(heap) || heap <= 0) throw new Error(`ABSORB_HEAP_MB must be a number of megabytes, got "${env.ABSORB_HEAP_MB}"`)
+  return [`--max-old-space-size=${heap}`]
 }
 
 /**
