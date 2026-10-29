@@ -69,8 +69,9 @@ to the lake's height: first the contracts the new factories created, then the lo
 several ranges at once. A contract with a `fromBlock` (the block it was deployed at) is read from
 there; one without it, from the dataset's `fromBlock`. RPC trouble is waited out for as long as it
 lasts, as the follower does. It merges each block into the chunk that covers it (blocks in a gap
-between chunks get a chunk of their own) and writes each changed chunk to a new folder as soon as all
-its blocks are read, so memory holds the new history of a few chunks, not all of it. It moves the
+between chunks get a chunk of their own). The history is staged on disk as it is read, and each
+changed chunk is written to a new folder as soon as all its blocks are read, so memory holds only the
+ranges being read, whatever the history's size. Absorbs run one at a time in a task, beside the portal. It moves the
 lake to the new folders with one manifest write, so the portal serves the lake before or after, never
 in between. A run that stops halfway is run
 again: merging the same history twice changes nothing. Absorbing is meant for contracts with little
@@ -149,6 +150,8 @@ npm run live                          # then point a squid at http://localhost:8
 | `PORT` | `live`, `serve` | Portal port, 8100 by default |
 | `MAX_RANGE`, `ADDRESSES_PER_CALL` | `live`, `follow` | Blocks and addresses per `eth_getLogs` (2000 and 500) |
 | `ABSORB_MAX_RANGE`, `ABSORB_CONCURRENCY` | `absorb` | Blocks per `eth_getLogs` while absorbing history, and ranges read at once (10,000 and 4) |
+| `ABSORB_HEAP_MB` | `live` | The heap of the `absorb` it runs, which shares the task with the portal (768) |
+| `ABSORB_DUCKDB_MEMORY_LIMIT`, `ABSORB_DUCKDB_MAX_TEMP` | `absorb` | The memory its chunk writes may use, and the disk they may spill to past it (`256MB` and `4GB`); the staged history takes disk besides |
 | `POLL_MS` | `live`, `follow` | How often a follower that is caught up looks for newly finalized blocks (5000) |
 | `CHUNK_SIZE_MB` | `backfill`, `live`, `follow` | Size of the data a chunk holds before it is written (64) |
 | `FLUSH_INTERVAL_MS` | `live` | Writes a chunk at least this often (30 minutes) |

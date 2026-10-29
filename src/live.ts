@@ -9,6 +9,7 @@ import { readCoverage } from './coverage'
 import { openRegistry } from './discover'
 import { HotChain } from './live/hot'
 import { Tail } from './live/tail'
+import { oneAtATime, scriptArgs } from './live/scripts'
 import { LiveView } from './live/view'
 import { NodeBehind } from './follow/fetch'
 import { RpcClient } from './follow/rpc'
@@ -125,12 +126,19 @@ async function asItStands(lakeDest: string, store: Store, dataset: string): Prom
   return new LiveView(lake, new Tail({ height: manifest.value.height, hash: manifest.value.hash }))
 }
 
-/** Runs one of this package's commands for a dataset, in a process of its own: they exit when done. */
+const absorbQueue = oneAtATime()
+
+/** Runs one of this package's commands for a dataset; absorbs wait for each other. */
 function runScript(script: string, dataset: string): Promise<void> {
+  return script === 'absorb.js' ? absorbQueue(() => spawnScript(script, dataset)) : spawnScript(script, dataset)
+}
+
+/** Runs one of this package's commands for a dataset, in a process of its own: they exit when done. */
+function spawnScript(script: string, dataset: string): Promise<void> {
   return new Promise((resolve, reject) => {
     // The bounds meant for development runs are left out: a backfill here always covers the whole dataset.
     const { STOP_BLOCK, FROM_BLOCK, LAKE_ADDRESSES, ...env } = process.env
-    const child = spawn(process.execPath, [join(__dirname, script)], { env: { ...env, DATASET: dataset }, stdio: 'inherit' })
+    const child = spawn(process.execPath, [...scriptArgs(script, env), join(__dirname, script)], { env: { ...env, DATASET: dataset }, stdio: 'inherit' })
     children.add(child)
     child.on('error', reject)
     child.on('exit', (code, signal) => {
