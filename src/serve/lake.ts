@@ -1,4 +1,5 @@
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
+import { createLogger } from '@subsquid/logger'
 import { Chunk, Manifest, MANIFEST_FILE } from '../manifest'
 import { openStore, Store } from '../store'
 import { BlockHeader, headerFromRpc } from './headers'
@@ -57,14 +58,54 @@ function duckdb(): Promise<DuckDBInstance> {
   return instance
 }
 
+const logger = createLogger('lake:portal')
+
+/**
+ * The secret that reads the lake. Credentials come from the usual AWS chain: the task role on ECS.
+ * They expire every few hours. REFRESH auto has DuckDB renew them when S3 refuses a request, but
+ * DuckDB 1.5 does so only for a 401, a 403 or a 400 ExpiredToken, not for a 400 InvalidToken.
+ */
+function lakeSecret(replace: boolean): string {
+  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
+  return `CREATE ${replace ? 'OR REPLACE ' : ''}SECRET lake (TYPE s3, PROVIDER credential_chain, REFRESH auto${region ? `, REGION '${region}'` : ''})`
+}
+
 /** Extensions and secrets belong to the instance, so they are set up once. */
 async function readFromS3(db: DuckDBConnection): Promise<void> {
-  // Credentials come from the usual AWS chain: the task role on ECS. They expire every few hours, and
-  // DuckDB renews chain credentials on its own only for the sts and web_identity chains, so REFRESH
-  // auto renews them before S3 starts refusing them.
   await db.run('INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;')
-  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
-  await db.run(`CREATE SECRET lake (TYPE s3, PROVIDER credential_chain, REFRESH auto${region ? `, REGION '${region}'` : ''})`)
+  await db.run(lakeSecret(false))
+}
+
+let renewing: Promise<void> | undefined
+
+/** Reads the chain again into the instance's secret, once for every query refused meanwhile. */
+function renewCredentials(db: DuckDBConnection): Promise<void> {
+  renewing ??= db
+    .run(lakeSecret(true))
+    .then(() => logger.warn('S3 refused the lake credentials; they were read from the chain again'))
+    .finally(() => {
+      renewing = undefined
+    })
+  return renewing
+}
+
+/** S3 refused the credentials themselves, which credentials read from the chain again would fix. */
+export function refusedCredentials(e: unknown): boolean {
+  return /\b(InvalidToken|ExpiredToken|TokenRefreshRequired)\b/.test(e instanceof Error ? e.message : String(e))
+}
+
+/**
+ * Runs `read`, and once more after `renew` if S3 refused the credentials. A second refusal fails the
+ * read: the credentials the chain gives are refused too, and retrying cannot fix that.
+ */
+export async function withRenewal<T>(read: () => Promise<T>, renew: () => Promise<void>): Promise<T> {
+  try {
+    return await read()
+  } catch (e) {
+    if (!refusedCredentials(e)) throw e
+    await renew()
+    return read()
+  }
 }
 
 /** A chunk folder as the writer names it: `<from>-<to>-<writer>`. */
@@ -113,7 +154,7 @@ export class LakeDataset {
   private queue: Promise<unknown> = Promise.resolve()
 
   private rows<T>(sql: string): Promise<T[]> {
-    const run = async () => {
+    const once = async () => {
       const timer = setTimeout(() => this.db.interrupt(), QUERY_TIMEOUT_MS)
       try {
         return (await this.db.runAndReadAll(sql)).getRowObjects() as unknown as T[]
@@ -121,6 +162,7 @@ export class LakeDataset {
         clearTimeout(timer)
       }
     }
+    const run = () => (this.base.startsWith('s3://') ? withRenewal(once, () => renewCredentials(this.db)) : once())
     const result = this.queue.then(run, run)
     this.queue = result.catch(() => undefined)
     return result
