@@ -5,7 +5,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { DuckDBInstance } from '@duckdb/node-api'
 import { Chunk, Manifest, MANIFEST_FILE } from '../manifest'
-import { LakeDataset, MAX_LOGS, PAGE_BUDGET_MS } from './lake'
+import { LakeDataset, MAX_LOGS, PAGE_BUDGET_MS, refusedCredentials, withRenewal } from './lake'
 import { parseQuery } from './query'
 
 const ADDRESS = '0x' + 'aa'.repeat(20)
@@ -161,4 +161,61 @@ test('check reads the last chunk, and fails on a lake that cannot be read', asyn
   const unreadable: Chunk = { dir: '0000000101-0000000200-0a0b0c0d', from: 101, to: 200 }
   writeManifest(lakeDir, { height: 200, hash: '0x200', chunks: [first, unreadable] })
   await assert.rejects((await LakeDataset.open(lakeDir, DATASET)).check())
+})
+
+/** The error DuckDB raised once S3 stopped taking the task's credentials. */
+const INVALID_TOKEN = new Error(
+  "HTTP Error: HTTP GET error reading 's3://lake/polygon-mainnet/chunks/x/logs.parquet' in region 'us-east-1' (HTTP 400 Bad Request)\n\nInvalidToken: The provided token is malformed or otherwise invalid."
+)
+
+test('a read S3 refuses for its credentials renews them once and reads again', async () => {
+  let reads = 0
+  let renewals = 0
+  const rows = await withRenewal(
+    async () => {
+      if (++reads === 1) throw INVALID_TOKEN
+      return ['row']
+    },
+    async () => {
+      renewals++
+    }
+  )
+  assert.deepEqual(rows, ['row'])
+  assert.equal(reads, 2)
+  assert.equal(renewals, 1)
+})
+
+test('a read refused again after the renewal fails, without renewing a second time', async () => {
+  let renewals = 0
+  await assert.rejects(
+    withRenewal(
+      () => Promise.reject(INVALID_TOKEN),
+      async () => {
+        renewals++
+      }
+    ),
+    /InvalidToken/
+  )
+  assert.equal(renewals, 1)
+})
+
+test('any other failure fails the read without renewing the credentials', async () => {
+  let renewals = 0
+  await assert.rejects(
+    withRenewal(
+      () => Promise.reject(new Error('HTTP 404 Not Found')),
+      async () => {
+        renewals++
+      }
+    ),
+    /404/
+  )
+  assert.equal(renewals, 0)
+})
+
+test('only refusals of the credentials themselves count as refused credentials', () => {
+  assert.equal(refusedCredentials(INVALID_TOKEN), true)
+  assert.equal(refusedCredentials(new Error('(HTTP 400 Bad Request)\n\nExpiredToken: The provided token has expired.')), true)
+  assert.equal(refusedCredentials(new Error('(HTTP 403 Forbidden)\n\nAccessDenied: Access Denied')), false)
+  assert.equal(refusedCredentials(new Error('(HTTP 400 Bad Request)\n\nAuthorizationHeaderMalformed')), false)
 })
