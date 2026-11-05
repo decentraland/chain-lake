@@ -257,3 +257,18 @@ test('a kept fork answer that still agrees is reused without asking the node', a
   chain.reorg(15, 'z')
   assert.equal(await hot.previousBlocks(19, known, 5), first)
 })
+
+test('a kept fork answer is not reused once the fork check no longer holds the refused block', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a')
+  const { hot, base } = setup(chain, 15)
+  await hot.poll()
+  const known = (n: number) => hot.hashOf(n)
+  assert.equal((await hot.previousBlocks(19, known, 5)).at(-1)!.hash, '0xa19')
+
+  // Block 19 is finalized on another branch and leaves what the fork check holds; it now asks the node.
+  chain.reorg(18, 'b')
+  Object.assign(base, { height: 19, hash: '0xb19' })
+  assert.equal(known(19), undefined)
+  assert.equal((await hot.previousBlocks(19, known, 5)).at(-1)!.hash, '0xb19')
+})

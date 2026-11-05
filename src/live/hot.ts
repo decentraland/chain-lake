@@ -181,7 +181,8 @@ export class HotChain {
    * and only the rest come from the node. Otherwise a node behind the hot blocks, or on the other
    * branch, would answer with the block the fork check has just refused, and the client would come
    * back from it at once. Answers are kept for a few seconds, so clients asking about the same fork
-   * share one set of RPC calls, but only while they agree with what the fork check holds.
+   * share one set of RPC calls, but only while the fork check holds the refused block and agrees
+   * with every hash in the answer.
    */
   async previousBlocks(number: number, known: (n: number) => string | undefined, count = 50): Promise<BlockRef[]> {
     const agrees = (b: BlockRef) => {
@@ -189,11 +190,13 @@ export class HotChain {
       return hash === undefined || hash === b.hash
     }
     const kept = this.forks.get(number)
-    if (kept && Date.now() - kept.at < FORK_ANSWER_TTL_MS && kept.blocks.every(agrees)) return kept.blocks
+    // Reused only while the fork check still holds the refused block itself: once it no longer does
+    // (finalized and written meanwhile), it asks the node, and the kept hash may be the one it refuses.
+    if (kept && Date.now() - kept.at < FORK_ANSWER_TTL_MS && known(number) !== undefined && kept.blocks.every(agrees)) return kept.blocks
     const numbers = Array.from({ length: count }, (_, i) => number - count + 1 + i).filter((n) => n >= 0)
     const held = new Map(numbers.map((n) => [n, known(n)] as const))
     const missing = numbers.filter((n) => held.get(n) === undefined)
-    const headers = missing.length ? await getHeaders(this.rpc, missing) : new Map()
+    const headers: Awaited<ReturnType<typeof getHeaders>> = missing.length ? await getHeaders(this.rpc, missing) : new Map()
     const blocks = numbers.map((n) => ({ number: n, hash: held.get(n) ?? headers.get(n)!.hash }))
     if (this.forks.size >= 100) this.forks.clear()
     this.forks.set(number, { at: Date.now(), blocks })
