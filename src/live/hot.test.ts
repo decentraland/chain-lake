@@ -211,3 +211,49 @@ test('hot blocks that no longer hang from the finalized base are not served unti
   assert.deepEqual(hot.head(), { number: 20, hash: '0xb20' })
   assert.equal(hot.page(query, 17, 20)!.upper.hash, '0xb20')
 })
+
+test('a fork answer takes the hashes the fork check holds, not a node behind them', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a')
+  const { hot } = setup(chain, 15)
+  chain.reorg(17, 'b')
+  await hot.poll()
+  assert.equal(hot.hashOf(19), '0xb19')
+
+  // The node that answers next is still on the branch that lost.
+  chain.reorg(17, 'a')
+  const blocks = await hot.previousBlocks(19, (n) => hot.hashOf(n), 10)
+  assert.deepEqual(
+    blocks.map((b) => b.hash),
+    ['0xa10', '0xa11', '0xa12', '0xa13', '0xa14', '0xa15', '0xa16', '0xb17', '0xb18', '0xb19']
+  )
+})
+
+test('a kept fork answer is not reused once the fork check holds another hash', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a')
+  const { hot } = setup(chain, 15)
+  await hot.poll()
+  const known = (n: number) => hot.hashOf(n)
+  assert.equal((await hot.previousBlocks(19, known, 5)).at(-1)!.hash, '0xa19')
+
+  // Within the answer's few seconds, a poll rebuilds the hot blocks on another branch.
+  chain.reorg(18, 'b')
+  await hot.poll()
+  assert.deepEqual(
+    (await hot.previousBlocks(19, known, 5)).map((b) => b.hash),
+    ['0xa15', '0xa16', '0xa17', '0xb18', '0xb19']
+  )
+})
+
+test('a kept fork answer that still agrees is reused without asking the node', async () => {
+  const chain = new FakeChain()
+  chain.extend(20, 'a')
+  const { hot } = setup(chain, 15)
+  await hot.poll()
+  const known = (n: number) => hot.hashOf(n)
+  const first = await hot.previousBlocks(19, known, 5)
+  // The node changes below the base, which the fork check does not hold; the kept answer stands.
+  chain.reorg(15, 'z')
+  assert.equal(await hot.previousBlocks(19, known, 5), first)
+})

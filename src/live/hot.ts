@@ -176,15 +176,25 @@ export class HotChain {
   }
 
   /**
-   * The canonical blocks below and at `number`, for a client to find where it forked. Answers are
-   * kept for a few seconds, so clients asking about the same fork share one set of RPC calls.
+   * The canonical blocks below and at `number`, for a client to find where it forked. `known` gives
+   * the hash the fork check holds for a block, when it holds one; those hashes are used as they are,
+   * and only the rest come from the node. Otherwise a node behind the hot blocks, or on the other
+   * branch, would answer with the block the fork check has just refused, and the client would come
+   * back from it at once. Answers are kept for a few seconds, so clients asking about the same fork
+   * share one set of RPC calls, but only while they agree with what the fork check holds.
    */
-  async previousBlocks(number: number, count = 50): Promise<BlockRef[]> {
+  async previousBlocks(number: number, known: (n: number) => string | undefined, count = 50): Promise<BlockRef[]> {
+    const agrees = (b: BlockRef) => {
+      const hash = known(b.number)
+      return hash === undefined || hash === b.hash
+    }
     const kept = this.forks.get(number)
-    if (kept && Date.now() - kept.at < FORK_ANSWER_TTL_MS) return kept.blocks
+    if (kept && Date.now() - kept.at < FORK_ANSWER_TTL_MS && kept.blocks.every(agrees)) return kept.blocks
     const numbers = Array.from({ length: count }, (_, i) => number - count + 1 + i).filter((n) => n >= 0)
-    const headers = await getHeaders(this.rpc, numbers)
-    const blocks = numbers.map((n) => ({ number: n, hash: headers.get(n)!.hash }))
+    const held = new Map(numbers.map((n) => [n, known(n)] as const))
+    const missing = numbers.filter((n) => held.get(n) === undefined)
+    const headers = missing.length ? await getHeaders(this.rpc, missing) : new Map()
+    const blocks = numbers.map((n) => ({ number: n, hash: held.get(n) ?? headers.get(n)!.hash }))
     if (this.forks.size >= 100) this.forks.clear()
     this.forks.set(number, { at: Date.now(), blocks })
     return blocks
