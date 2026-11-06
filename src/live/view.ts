@@ -18,19 +18,26 @@ export class LiveView implements ChainView {
 
   constructor(private readonly lake: LakeDataset, private readonly tail: Tail, chain?: HotChain) {
     if (chain) {
+      /**
+       * The hash this view holds for a block, without asking the node. Above the finalized head the
+       * hot blocks decide; at and below it, only finalized blocks do.
+       */
+      const known = (number: number): string | undefined => {
+        const finalized = this.tail.processed
+        if (number > finalized.height) return chain.hashOf(number)
+        if (number === finalized.height) return finalized.hash
+        return this.tail.headerOf(number)?.hash
+      }
       this.hot = {
         head: () => chain.head(),
         page: (query, from, to) => chain.page(query, from, to),
-        previousBlocks: (number) => chain.previousBlocks(number),
+        previousBlocks: (number) => chain.previousBlocks(number, known),
         hashAt: async (number) => {
-          // Above the finalized head the hot blocks decide; at and below it, only finalized blocks do.
-          const finalized = this.tail.processed
-          if (number > finalized.height) return chain.hashOf(number)
-          if (number === finalized.height) return finalized.hash
-          const held = this.tail.headerOf(number)?.hash
-          if (held !== undefined) return held
+          const finalized = this.tail.processed.height
+          const held = known(number)
+          if (held !== undefined || number > finalized) return held
           // A recently finalized block the client may have seen while it was hot.
-          if (number > finalized.height - FORK_CHECK_DEPTH) return (await headerFromRpc(this.lake.dataset, number)).hash
+          if (number > finalized - FORK_CHECK_DEPTH) return (await headerFromRpc(this.lake.dataset, number)).hash
           return undefined
         },
       }
