@@ -12,7 +12,7 @@ import { configuredContracts, RegisteredContract, Registry, REGISTRY_FILE } from
 import { fetchFollowing } from './follow/fetch'
 import { RpcClient, untilAnswered } from './follow/rpc'
 import { Chunk, Manifest, MANIFEST_FILE } from './manifest'
-import { appendReceipt, Filters, Identity, identityOf, Read, segmentsOf } from './receipts'
+import { appendReceipt, Filters, Identity, IdentitySource, lazyIdentity, Read, resolveIdentity, segmentsOf } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { Conflict, openStore, Store } from './store'
 import { columns } from './tables'
@@ -67,8 +67,11 @@ export async function absorb(options: {
   maxAttempts?: number
   /** Where the new history is staged and DuckDB spills; a new temporary directory by default, removed after. A directory given here is the caller's to remove. */
   workDir?: string
-  /** Writes a receipt of what the absorb read once its publication wins; see `receipts.ts`. */
-  receipts?: { identity: Identity; filters: Filters }
+  /**
+   * Writes a receipt of what the absorb read once its publication wins; see `receipts.ts`. The identity
+   * is asked for only once the lake is checked complete, before anything is published.
+   */
+  receipts?: { identity: IdentitySource; filters: Filters }
 }): Promise<void> {
   const { lakeDest, config, store, fetch, maxRange } = options
   const concurrency = Math.max(1, options.concurrency ?? 1)
@@ -205,6 +208,8 @@ export async function absorb(options: {
         next.push(chunk)
       }
 
+      // The lake the receipt will belong to, named (if it is not yet) only now that it is known complete.
+      const identity: Identity | undefined = options.receipts && (await resolveIdentity(options.receipts.identity))
       const known = new Set(registry.value.contracts.map((c) => c.address))
       const children = [...created.values()].sort((x, y) => x.createdAt!.block - y.createdAt!.block || x.createdAt!.logIndex - y.createdAt!.logIndex)
       const added = [...missing, ...children].filter((c) => !known.has(c.address))
@@ -220,11 +225,11 @@ export async function absorb(options: {
       if (options.receipts && reads.length) {
         // Every read was checked to end on the lake's block before anything was published.
         const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
-        const { identity, filters } = options.receipts
+        const { filters } = options.receipts
         // The absorb is published either way: a receipt that cannot be written leaves it unproven.
         await segmentsOf(filters, reads)
           .then((segments) =>
-            appendReceipt(store, identity, {
+            appendReceipt(store, identity!, {
               kind: 'absorb',
               source: 'rpc',
               segments,
@@ -449,20 +454,19 @@ class ChunkFiles {
   }
 }
 
-async function main() {
-  const config = loadConfig()
-  const lakeDest = required('LAKE_DEST')
-  const store = openStore(lakeDest, config.dataset)
-  const rpc = new RpcClient(rpcUrl(config.dataset))
+/**
+ * The `absorb` command for one dataset: refuses an RPC serving another chain, then absorbs what the
+ * config gained. Nothing is written to a lake that is not complete, the lake's name included.
+ */
+export async function absorbDataset(config: DatasetConfig, lakeDest: string, store: Store, rpc: RpcClient): Promise<void> {
   const perCall = Number(process.env.ADDRESSES_PER_CALL || 500)
   // What it reads is receipted as this dataset's: an RPC serving another chain stops it here.
   await checkRpcChain(rpc, config, logger)
-  const identity = await identityOf(store, config)
   await absorb({
     lakeDest,
     config,
     store,
-    receipts: { identity, filters: new Filters(store) },
+    receipts: { identity: lazyIdentity(store, config), filters: new Filters(store) },
     maxRange: Number(process.env.ABSORB_MAX_RANGE || 10_000),
     concurrency: Number(process.env.ABSORB_CONCURRENCY || 4),
     // RPC trouble is waited out however long it lasts, as the follower does: giving up would start the
@@ -470,6 +474,12 @@ async function main() {
     fetch: (followed, factories, from, to) =>
       untilAnswered(`${config.dataset}: reading blocks ${from}-${to}`, () => fetchFollowing(rpc, followed, factories, perCall, from, to), logger),
   })
+}
+
+async function main() {
+  const config = loadConfig()
+  const lakeDest = required('LAKE_DEST')
+  await absorbDataset(config, lakeDest, openStore(lakeDest, config.dataset), new RpcClient(rpcUrl(config.dataset)))
 }
 
 if (require.main === module) {

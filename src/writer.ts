@@ -3,7 +3,7 @@ import { Database, Dest } from '@subsquid/file-store'
 import { Logger } from '@subsquid/logger'
 import { openDest } from './dest'
 import { Chunk, Manifest, MANIFEST_FILE } from './manifest'
-import { appendReceipt, Filters, Identity, ScanLog, ScanSource, segmentsOf } from './receipts'
+import { appendReceipt, Filters, IdentitySource, resolveIdentity, ScanLog, ScanSource, segmentsOf } from './receipts'
 import { Conflict, Store, Versioned } from './store'
 import { tables } from './tables'
 
@@ -93,7 +93,7 @@ export function openWriter(
         // The commit is published either way: a receipt that cannot be written leaves its blocks unproven,
         // and never stops the writer.
         const receipts = options.receipts
-        if (receipts) await recordCommit(store, receipts, prev, state, closed).catch((e) => receipts.log.error({ err: e }, `blocks to ${state.height} got no receipt`))
+        if (receipts) await recordCommit(store, receipts, prev, state, closed, version).catch((e) => receipts.log.error({ err: e }, `blocks to ${state.height} got no receipt`))
       },
     },
   })
@@ -102,7 +102,7 @@ export function openWriter(
 /** What a writer needs to write the receipt of each commit. */
 export interface CommitReceipts {
   /** The lake's identity, or how to get it once the lake has a manifest (see `lazyIdentity`). */
-  identity: Identity | (() => Promise<Identity>)
+  identity: IdentitySource
   source: ScanSource
   /** The first block the source reads: no commit claims a block below it, even its first one. */
   lowerBound: number
@@ -121,7 +121,8 @@ async function recordCommit(
   receipts: CommitReceipts,
   prev: { height: number; hash: string } | undefined,
   state: { height: number; hash: string },
-  closed: Chunk[]
+  closed: Chunk[],
+  published: string
 ): Promise<void> {
   const from = Math.max(prev ? prev.height + 1 : receipts.lowerBound, receipts.lowerBound)
   const reads = receipts.scans.take(from, state.height)
@@ -130,8 +131,14 @@ async function recordCommit(
     receipts.log.warn(`blocks ${from}-${state.height} were committed without a read of each: they get no receipt`)
     return
   }
+  // The receipt belongs to the lake this commit was published to, so it is written only while the
+  // manifest is still the one published, both before the lake's identity is read and after: a manifest
+  // moved on by another writer, or another lake switched in, leaves these blocks unproven.
+  const ours = async () => (await store.version(MANIFEST_FILE)) === published
+  if (!(await ours())) return receipts.log.warn(`blocks ${from}-${state.height} get no receipt: the manifest is no longer the one published`)
+  const identity = await resolveIdentity(receipts.identity)
+  if (!(await ours())) return receipts.log.warn(`blocks ${from}-${state.height} get no receipt: the manifest changed while the lake was named`)
   const segments = await segmentsOf(receipts.filters, reads)
-  const identity = typeof receipts.identity === 'function' ? await receipts.identity() : receipts.identity
   await appendReceipt(store, identity, {
     kind: 'commit',
     source: receipts.source,

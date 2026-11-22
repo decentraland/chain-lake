@@ -127,6 +127,11 @@ export async function refuseReplacedLake(store: Store, config: DatasetConfig): P
   if (lakeId) throw new Error(`${config.dataset}: the location held lake ${lakeId}, whose manifest is gone; start the new lake in an empty location`)
 }
 
+/** An identity, or how to get it once it may be asked for (see `lazyIdentity`). */
+export type IdentitySource = Identity | (() => Promise<Identity>)
+
+export const resolveIdentity = (source: IdentitySource): Promise<Identity> => (typeof source === 'function' ? source() : Promise.resolve(source))
+
 /**
  * The lake's identity for its receipts, asked for only when the first receipt is written, once the lake
  * has a manifest; a failed attempt is tried again by the next receipt.

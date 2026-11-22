@@ -150,3 +150,24 @@ test('a lake whose naming is slow is served meanwhile, and its RPC headers come 
   assert.equal(fetches, 1)
   assert.equal(followed, false, 'no writer before the lake is named')
 })
+
+test('a refused RPC ends the follow at once, though the lake is still being named', async (t) => {
+  countFetches(t)
+  const dir = mkdtempSync(join(tmpdir(), 'chain-lake-follow-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A], complete: { height: 20 } }, null)
+  await store.write<Registry>(REGISTRY_FILE, { dataset: DATASET, height: 20, contracts: [{ name: 'A', address: A }] }, null)
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64 })
+  await db.connect()
+  await db.transact({ prevHead: head(-1), nextHead: head(20), isOnTop: true } as never, async (s) => {
+    writeBlocks(s as never, [block(10)])
+    s.setForceFlush(true)
+  })
+  const held: Store = {
+    read: (name) => store.read(name),
+    version: (name) => store.version(name),
+    write: (name, value, version) => (name === COVERAGE_FILE ? new Promise(() => {}) : store.write(name, value, version)),
+  }
+  await assert.rejects(follow(dir, held, DATASET, config, () => {}, { checkSource: () => Promise.reject(new Error('the RPC serves chain 137')) }), /chain 137/)
+})

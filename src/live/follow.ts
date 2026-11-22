@@ -53,9 +53,8 @@ export async function follow(
   // The check alone releases the headers; naming the lake for its receipts runs beside it, and both
   // come before the writer. An RPC serving another chain stops it here.
   const checked = (options.checkSource ?? (() => checkRpcChain(rpc, config, log)))().then(() => lake.allowRpcHeaders())
-  checked.catch(() => {})
-  const identity = await identityOf(store, config)
-  await checked
+  // A refused RPC ends the start at once, whether or not the lake is named yet.
+  const [identity] = await Promise.all([identityOf(store, config), checked])
 
   const scans = ScanLog.reading()
   const source = new RpcSource(rpc, config, registry, save, {

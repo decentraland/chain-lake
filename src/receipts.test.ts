@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'fs'
+import { cpSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { test, TestContext } from 'node:test'
 import { Logger } from '@subsquid/logger'
-import { absorb, FetchHistory } from './absorb'
+import { absorb, absorbDataset, FetchHistory } from './absorb'
 import { checkPortalChain, checkRpcChain } from './chain'
 import { DatasetConfig, Factory } from './config'
 import { Coverage, COVERAGE_FILE } from './coverage'
@@ -634,4 +634,72 @@ test('an answer to eth_chainId that is not a chain id is waited out, not taken f
   } as unknown as RpcClient
   await checkRpcChain(client, config, quiet)
   assert.equal(calls, 2)
+})
+
+test('a receipt is never written to a lake switched in after its commit was published', async (t) => {
+  // The lake being written: X has a log at 20. The copy switched in: same height and hash, no log of X.
+  const dir = tempDir(t)
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A, X] }, null)
+  const other = tempDir(t)
+  const otherStore = openStore(other, DATASET)
+  const otherDb = openWriter(other, DATASET, otherStore, { chunkSizeMb: 64 })
+  await otherDb.connect()
+  await otherDb.transact(tx(-1, 50), async (s) => {
+    writeBlocks(s as never, [onlyA(10)])
+    s.setForceFlush(true)
+  })
+  const copy = (await otherStore.read<Manifest>(MANIFEST_FILE))!.value
+  for (const c of copy.chunks) cpSync(join(other, DATASET, 'chunks', c.dir), join(dir, DATASET, 'chunks', c.dir), { recursive: true })
+  const replacement: Identity = { dataset: DATASET, chainId: 1, lakeId: 'c'.repeat(32) }
+  const switchIn = async () => {
+    const manifest = (await store.read<Manifest>(MANIFEST_FILE))!
+    await store.write<Manifest>(MANIFEST_FILE, copy, manifest.version)
+    const coverage = (await store.read<Coverage>(COVERAGE_FILE))!
+    await store.write<Coverage>(COVERAGE_FILE, { contracts: [A, X], complete: { height: 50 }, lakeId: replacement.lakeId }, coverage.version)
+    await appendReceipt(store, replacement, { kind: 'commit', source: 'rpc', segments: [{ from: 0, to: 50, filter: await new Filters(store).digest([A]) }], to: 50, toHash: '0x50', wrote: [], replaced: {} })
+  }
+  // The copy is switched in right after the commit wins its manifest, before the receipt is written.
+  let switched = false
+  const writes: Store = {
+    read: (name) => store.read(name),
+    version: (name) => store.version(name),
+    async write(name, value, version) {
+      const written = await store.write(name, value, version)
+      // The commit to 50, not the empty manifest file-store writes when it connects to a new lake.
+      if (name === MANIFEST_FILE && (value as Manifest).height === 50 && !switched) {
+        switched = true
+        await switchIn()
+      }
+      return written
+    },
+  }
+  const scans = ScanLog.reading()
+  const db = openWriter(dir, DATASET, writes, {
+    chunkSizeMb: 64,
+    receipts: { identity: lazyIdentity(store, config), source: 'rpc', lowerBound: 0, scans, filters: new Filters(store), log: quiet },
+  })
+  await db.connect()
+  scans.add(0, 50, [A, X])
+  await db.transact(tx(-1, 50), async (s) => {
+    writeBlocks(s as never, [chain.get(10)!, chain.get(20)!])
+    s.setForceFlush(true)
+  })
+  assert.ok(switched)
+  const ledger = (await store.read<Ledger>(scansFile(replacement.lakeId)))!.value
+  assert.deepEqual(ledger.receipts.map((r) => r.segments[0].filter), [await new Filters(store).digest([A])], 'only the copy’s own receipt')
+  const proven = await claimsAt(store, replacement)
+  assert.equal(proven.from.has(X), false, 'the copy holds no log of X, and is not said to')
+  assert.equal(proven.from.get(A), 0)
+})
+
+test('an absorb refused on a lake that is not built yet names nothing, and leaves its first backfill admissible', async (t) => {
+  const dir = tempDir(t)
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A] }, null)
+  const before = (await store.read<Coverage>(COVERAGE_FILE))!
+  const rpc = { call: async () => '0x1' } as unknown as RpcClient
+  await assert.rejects(absorbDataset(gaining({ name: 'X', address: X }), dir, store, rpc), /only a complete lake takes new contracts/)
+  assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!, before, 'coverage untouched')
+  await refuseReplacedLake(store, config)
 })
