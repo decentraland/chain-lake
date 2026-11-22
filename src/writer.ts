@@ -90,7 +90,10 @@ export function openWriter(
         const version = await store.write(MANIFEST_FILE, next, manifest?.version ?? null)
         manifest = { value: next, version }
         options.onCommit?.(next)
-        if (options.receipts) await recordCommit(store, options.receipts, prev, state, closed)
+        // The commit is published either way: a receipt that cannot be written leaves its blocks unproven,
+        // and never stops the writer.
+        const receipts = options.receipts
+        if (receipts) await recordCommit(store, receipts, prev, state, closed).catch((e) => receipts.log.error({ err: e }, `blocks to ${state.height} got no receipt`))
       },
     },
   })

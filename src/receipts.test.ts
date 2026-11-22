@@ -458,3 +458,19 @@ test('a chunk a later absorb rewrote again still witnesses the first absorb', as
   assert.deepEqual([proven.from.get(X), proven.from.get(Z)], [0, 0])
   assert.equal((await claimsAt(store, identity, afterX)).from.has(Z), false)
 })
+
+test('a ledger this build cannot write leaves the commit published, without a receipt', async (t) => {
+  const dir = tempDir(t)
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A] }, null)
+  const identity = await identityOf(store, config)
+  await store.write(SCANS_FILE, { schemaVersion: 2, ...identity, receipts: [] }, null)
+  const errors: string[] = []
+  const log = { ...quiet, error: (_: unknown, message: string) => void errors.push(message) } as unknown as Logger
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64, receipts: { identity, source: 'rpc', lowerBound: 0, scans: ScanLog.constant([A]), filters: new Filters(store), log } })
+  await db.connect()
+  await db.transact(tx(-1, 20), async (s) => s.setForceFlush(true))
+  assert.equal((await manifestOf(store)).height, 20)
+  assert.equal((await store.read<{ schemaVersion: number }>(SCANS_FILE))!.value.schemaVersion, 2, 'left as it was')
+  assert.deepEqual(errors, ['blocks to 20 got no receipt'])
+})

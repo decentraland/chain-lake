@@ -218,15 +218,21 @@ export async function absorb(options: {
           log.error(`${config.dataset}: the read ended at block ${height} with hash ${end ?? 'unknown'}, and the lake holds ${hash}: no receipt`)
         } else {
           const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
-          await appendReceipt(store, options.receipts.identity, {
-            kind: 'absorb',
-            source: 'rpc',
-            segments: await segmentsOf(options.receipts.filters, reads),
-            to: height,
-            toHash: end,
-            wrote,
-            replaced: Object.fromEntries(wrote.flatMap((dir) => (origins.get(dir) ? [[origins.get(dir)!, dir]] : []))),
-          })
+          const { identity, filters } = options.receipts
+          // The absorb is published either way: a receipt that cannot be written leaves it unproven.
+          await segmentsOf(filters, reads)
+            .then((segments) =>
+              appendReceipt(store, identity, {
+                kind: 'absorb',
+                source: 'rpc',
+                segments,
+                to: height,
+                toHash: end,
+                wrote,
+                replaced: Object.fromEntries(wrote.flatMap((dir) => (origins.get(dir) ? [[origins.get(dir)!, dir]] : []))),
+              })
+            )
+            .catch((e) => log.error({ err: e }, `${config.dataset}: the absorb got no receipt`))
         }
       }
       await recordCoverage(store, config, factories, missingAddresses, maxAttempts)
