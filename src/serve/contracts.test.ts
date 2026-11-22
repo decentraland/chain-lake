@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { cpSync, mkdtempSync, readdirSync, renameSync, rmSync } from 'fs'
+import { cpSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { AddressInfo } from 'net'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -76,7 +76,13 @@ const query = (from: number, to: number, address = A) => ({ type: 'evm', fromBlo
 async function stream(base: string, route: string, body: unknown) {
   const res = await fetch(`${base}/${route}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
   const lines = (await res.text()).split('\n').filter(Boolean).map((l) => JSON.parse(l) as { header: { number: number }; logs?: unknown[] })
-  return { status: res.status, revision: res.headers.get('x-lake-coverage-revision'), blocks: lines.filter((l) => l.logs?.length).map((l) => [l.header.number, l.logs!.length]) }
+  return {
+    status: res.status,
+    revision: res.headers.get('x-lake-coverage-revision'),
+    blocks: lines.filter((l) => l.logs?.length).map((l) => [l.header.number, l.logs!.length]),
+    last: lines.at(-1)?.header.number,
+    heads: ['x-sqd-finalized-head-number', 'x-sqd-finalized-head-hash', 'x-sqd-head-number'].map((h) => res.headers.get(h)),
+  }
 }
 
 /** A store whose reads of some files wait for `release`, or fail once, as the test arranges. */
@@ -266,6 +272,15 @@ test('a filter read that fails is a 503, and the answer once it reads is whole',
   assert.deepEqual((await provider.contracts()).contracts, [{ address: A, from: 0 }])
 })
 
+test('a stored filter that is not JSON proves nothing, and is no 503', async (t) => {
+  const { dir, identity } = await lake(t)
+  const filters = readdirSync(join(dir, DATASET)).filter(isFilter)
+  assert.ok(filters.length)
+  for (const f of filters) writeFileSync(join(dir, DATASET, f), '{"add":["0x')
+  const answer = await new CoverageProvider(openStore(dir, DATASET), identity, { static: true }).contracts()
+  assert.deepEqual([answer.finalized, answer.contracts], [{ number: 50, hash: '0x50' }, []])
+})
+
 test('with no receipt counting the answer has no height; with receipts that prove no address, it has one and lists none', async (t) => {
   const dir = tempDir(t)
   const store = openStore(dir, DATASET)
@@ -377,6 +392,64 @@ test('a static view serves an older copy of its lake at that copy’s lower heig
   assert.deepEqual(await (await fetch(`${base}/finalized-head`)).json(), { number: 40, hash: '0x40' })
   const page = await stream(base, 'finalized-stream', query(0, 40, X))
   assert.deepEqual([page.status, page.blocks, page.revision], [200, [[20, 1]], answer.coverageRevision])
+})
+
+/**
+ * A static view of a lake at 50 whose lake is switched for `replacement` once a request read its head,
+ * just before its page is read. Its head then bounces back to 50, so a response that names a head read
+ * after the page, rather than the one its page was read at, shows.
+ */
+async function switchedBeforePage(t: TestContext, dir: string, replacement: string): Promise<string> {
+  const view = await openStaticView(dir, DATASET, () => {}, { manifestTtlMs: -1 })
+  let switched = false
+  return portal(t, async () => ({
+    ...view,
+    head: async () => (switched ? { number: 50, hash: '0x50' } : view.head()),
+    page: (query, from, to) => {
+      switchLakes(dir, replacement)
+      switched = true
+      return view.page(query, from, to)
+    },
+  }))
+}
+
+test('a static page read once the head is taken ends at an older copy restored in between, and names that copy’s revision and head', async (t) => {
+  for (const route of ['finalized-stream', 'stream']) {
+    for (const [q, blocks, last] of [
+      [query(0, 50, X), [[20, 1]], 20],
+      // A page ending below the copy's head still names the copy's head, not its own end.
+      [query(0, 10), [[10, 1]], 10],
+    ] as const) {
+      const { dir, identity } = await lake(t)
+      const older = await lakeWithX(t, identity.lakeId, 20)
+      const base = await switchedBeforePage(t, dir, older.dir)
+      // The head is 50, the lake's as it stood; the page is read from the copy, which ends at 20.
+      const page = await stream(base, route, q)
+      assert.deepEqual([page.status, page.blocks, page.last, page.revision, page.heads], [200, blocks, last, revisionOf(older.manifest), ['20', '0x20', '20']], route)
+    }
+  }
+})
+
+test('a static page asked above an older copy restored once the head is taken is a 204 naming the copy’s head', async (t) => {
+  for (const route of ['finalized-stream', 'stream']) {
+    const { dir, identity } = await lake(t)
+    const older = await lakeWithX(t, identity.lakeId, 20)
+    const base = await switchedBeforePage(t, dir, older.dir)
+    const page = await stream(base, route, query(30, 50))
+    assert.deepEqual([page.status, page.last, page.heads], [204, undefined, ['20', '0x20', '20']], route)
+  }
+})
+
+test('a live page from the files names the follower’s head, above the manifest it was read from', async (t) => {
+  const { dir, store } = await lake(t)
+  const tail = new Tail({ height: 50, hash: '0x50' })
+  tail.add([block(60, 0)])
+  const base = await portal(t, async () => new LiveView(await LakeDataset.open(dir, DATASET), tail))
+  const manifest = (await store.read<Manifest>(MANIFEST_FILE))!.value
+  for (const route of ['finalized-stream', 'stream']) {
+    const page = await stream(base, route, query(0, 30))
+    assert.deepEqual([page.status, page.blocks, page.last, page.revision, page.heads], [200, [[10, 1], [30, 1]], 30, revisionOf(manifest), ['60', '0x60', '60']], route)
+  }
 })
 
 test('a static answer whose lake is switched for a copy of it while the ledger is read is a 503', async (t) => {

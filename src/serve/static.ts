@@ -40,16 +40,16 @@ export async function openStaticView(lakeDir: string, dataset: string, obsolete:
   }
 }
 
-/**
- * The views `serve` answers with, one per dataset the lake directory holds, opened on first request. A
- * view that failed to open, or that found its location holding another lake, is opened anew by the next
- * request; it drops only itself, so a late request of a view already replaced leaves the new one alone.
- */
 export interface StaticOptions {
   /** How long a view reuses a manifest read for its pages; five seconds by default. */
   manifestTtlMs?: number
 }
 
+/**
+ * The views `serve` answers with, one per dataset the lake directory holds, opened on first request. A
+ * view that failed to open, or that found its location holding another lake, is opened anew by the next
+ * request; it drops only itself, so a late request of a view already replaced leaves the new one alone.
+ */
 export function staticViews(lakeDir: string, options: StaticOptions = {}): (dataset: string) => Promise<ChainView> | undefined {
   const views = new Map<string, Promise<ChainView>>()
   return (dataset) => {

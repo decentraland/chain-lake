@@ -1,7 +1,7 @@
 import { readCoverage } from '../coverage'
 import { Manifest, MANIFEST_FILE } from '../manifest'
 import { claims, digestOf, FilterObject, filterFile, Identity, Ledger, scansFile } from '../receipts'
-import { Store } from '../store'
+import { NotJson, Store } from '../store'
 import { LakeDataset, revisionOf } from './lake'
 import { NotReady } from './server'
 
@@ -105,11 +105,21 @@ export class CoverageProvider {
     return (this.ledger = read && { version: read.version, value: read.value })
   }
 
-  /** A filter object, kept once it matches its name; a read that fails is not kept, and is tried again. */
+  /**
+   * A filter object, kept once it matches its name; a read that fails is not kept, and is tried again.
+   * A stored object that is not JSON proves nothing, as one that does not match its name: it is written
+   * whole before any receipt names it, so reading it again would not change it.
+   */
   private async filter(digest: string): Promise<FilterObject | undefined> {
     const known = this.filters.get(digest)
     if (known) return known
-    const object = (await this.store.read<FilterObject>(filterFile(digest)))?.value
+    let object: FilterObject | undefined
+    try {
+      object = (await this.store.read<FilterObject>(filterFile(digest)))?.value
+    } catch (e) {
+      if (e instanceof NotJson) return undefined
+      throw e
+    }
     if (object && Array.isArray(object.add) && digestOf(object) === digest) this.filters.set(digest, object)
     return object
   }

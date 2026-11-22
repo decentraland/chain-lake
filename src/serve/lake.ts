@@ -40,9 +40,27 @@ export interface Page {
   headers: Map<number, BlockHeader>
   /** The revision of the manifest a page from the lake's files was read from; see `revisionOf`. */
   revision?: string
+  /**
+   * The head a response with this page names, when it is the manifest the page was read from: a view
+   * that can go back (a lake restored from an older copy) may hold less than the head read before.
+   */
+  head?: { number: number; hash: string }
 }
 
 const revisions = new WeakMap<Manifest, string>()
+
+/**
+ * A page asked above what the lake holds now, a lake restored from an older copy since the head was
+ * read; with the head it holds, as the page's read found it.
+ */
+export class Receded extends Error {
+  constructor(
+    message: string,
+    readonly head: { number: number; hash: string }
+  ) {
+    super(message)
+  }
+}
 
 /**
  * The revision of a manifest: the digest of its height, hash and chunks. Two pages, or a page and a
@@ -287,11 +305,17 @@ export class LakeDataset {
 
   /**
    * The logs, transactions and headers of the blocks in [from, to] that the query asks for, all from
-   * one manifest, whose revision the page carries.
+   * one manifest, whose revision the page carries. The page ends at or before that manifest's height: a
+   * view that is not monotonic can read it below the head the request was bounded by (a lake restored
+   * from an older copy), names it as the page's head, and throws `Receded` when it is below `from`.
    */
   async page(query: EvmQuery, from: number, to: number): Promise<Page> {
     const snapshot = await this.current()
-    return { ...(await this.read(snapshot, query, from, to, true)), revision: revisionOf(snapshot) }
+    const head = { number: snapshot.height, hash: snapshot.hash }
+    if (from > snapshot.height) throw new Receded(`${this.dataset}: the lake holds blocks up to ${snapshot.height}, below ${from}`, head)
+    const page = { ...(await this.read(snapshot, query, from, Math.min(to, snapshot.height), true)), revision: revisionOf(snapshot) }
+    // A lake that only grows holds at least the head read before the page; one that can go back names its own.
+    return this.monotonic ? page : { ...page, head }
   }
 
   private async read(snapshot: Manifest, query: EvmQuery, from: number, to: number, capped: boolean): Promise<Page> {
