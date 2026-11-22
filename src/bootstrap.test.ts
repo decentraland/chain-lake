@@ -26,6 +26,9 @@ async function setup(t: TestContext, prepare: (store: Store) => Promise<void>, b
     } else {
       const current = await store.read(MANIFEST_FILE)
       await store.write(MANIFEST_FILE, { height: backfillTo, hash: '0x', chunks: [] }, current?.version ?? null)
+      // The backfill names the lake for its receipts, as `identityOf` does.
+      const coverage = (await store.read<Coverage>(COVERAGE_FILE))!
+      if (!coverage.value.lakeId) await store.write<Coverage>(COVERAGE_FILE, { ...coverage.value, lakeId: 'named by the backfill' }, coverage.version)
     }
   }
   await prepare(store)
@@ -36,7 +39,9 @@ test('a new dataset is discovered, backfilled and recorded as complete', async (
   const { store, ran, go } = await setup(t, async () => {})
   await go()
   assert.deepEqual(ran, ['discover.js', 'backfill.js'])
-  assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!.value.complete, { height: 100 })
+  const coverage = (await store.read<Coverage>(COVERAGE_FILE))!.value
+  assert.deepEqual(coverage.complete, { height: 100 })
+  assert.equal(coverage.lakeId, 'named by the backfill', 'what the backfill wrote is kept')
 
   // From then on, nothing runs.
   ran.length = 0

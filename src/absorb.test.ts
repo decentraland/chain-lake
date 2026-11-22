@@ -62,6 +62,8 @@ const rpc: FetchHistory = async (followed, factories, from, to) => {
   const created = createdIn(inRange, factories)
   const addresses = new Set([...followed, ...created.map((c) => c.address)])
   const blocks = inRange.map((b) => ({ ...b, logs: b.logs.filter((l) => addresses.has(l.address)) }))
+  // As `fetchRange`, always with the header of the range's end.
+  if (!blocks.some((b) => b.header.number === to)) blocks.push(block(to, []))
   return { blocks, created }
 }
 

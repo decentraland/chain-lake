@@ -44,7 +44,8 @@ async function main() {
   await checkRpcChain(rpc, config, logger)
   // A lake no coverage record names (a development lake from block 0) gets no receipts.
   const identity = (await readCoverage(store)) ? await identityOf(store, config) : undefined
-  const scans = ScanLog.reading()
+  // Reads are kept for a receipt only when there will be one.
+  const scans = identity && ScanLog.reading()
   const source = new RpcSource(rpc, config, registry, save, {
     maxRange: Number(process.env.MAX_RANGE || 2000),
     addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
@@ -57,7 +58,7 @@ async function main() {
   const db = openWriter(lakeDest, config.dataset, store, {
     chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
     startAt: pinned.version,
-    receipts: identity && { identity, source: 'rpc', lowerBound: pinned.value.height + 1, scans, filters: new Filters(store), log: logger },
+    receipts: identity && scans && { identity, source: 'rpc', lowerBound: pinned.value.height + 1, scans, filters: new Filters(store), log: logger },
   })
 
   logger.info(`following ${config.dataset}: ${registry.contracts.length} contracts, registry at block ${registry.height}`)

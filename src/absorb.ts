@@ -175,6 +175,12 @@ export async function absorb(options: {
       if (gone) throw new Error(`${config.dataset}: chunk ${gone} left the lake while absorbing; run it again`)
       if (manifest.value.height > fetchedTo) {
         await read(fetchedTo + 1, manifest.value.height, manifest.value.chunks)
+        // A read that did not end on the block the lake holds read another branch: none of it is
+        // published, and no later read can make up for it.
+        const end = observed.get(manifest.value.height)
+        if (end === undefined || end.toLowerCase() !== manifest.value.hash.toLowerCase()) {
+          throw new Error(`${config.dataset}: the read ended at block ${manifest.value.height} with hash ${end ?? 'unknown'}, and the lake holds ${manifest.value.hash}; nothing was absorbed`)
+        }
         fetchedTo = manifest.value.height
       }
 
@@ -211,29 +217,23 @@ export async function absorb(options: {
         continue
       }
       if (options.receipts) {
-        const { height, hash } = manifest.value
-        const end = observed.get(height)
-        if (end === undefined || end.toLowerCase() !== hash.toLowerCase()) {
-          // The read was not on the branch the lake holds, so what it found (or did not) proves nothing.
-          log.error(`${config.dataset}: the read ended at block ${height} with hash ${end ?? 'unknown'}, and the lake holds ${hash}: no receipt`)
-        } else {
-          const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
-          const { identity, filters } = options.receipts
-          // The absorb is published either way: a receipt that cannot be written leaves it unproven.
-          await segmentsOf(filters, reads)
-            .then((segments) =>
-              appendReceipt(store, identity, {
-                kind: 'absorb',
-                source: 'rpc',
-                segments,
-                to: height,
-                toHash: end,
-                wrote,
-                replaced: Object.fromEntries(wrote.flatMap((dir) => (origins.get(dir) ? [[origins.get(dir)!, dir]] : []))),
-              })
-            )
-            .catch((e) => log.error({ err: e }, `${config.dataset}: the absorb got no receipt`))
-        }
+        // Every read was checked to end on the lake's block before anything was published.
+        const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
+        const { identity, filters } = options.receipts
+        // The absorb is published either way: a receipt that cannot be written leaves it unproven.
+        await segmentsOf(filters, reads)
+          .then((segments) =>
+            appendReceipt(store, identity, {
+              kind: 'absorb',
+              source: 'rpc',
+              segments,
+              to: manifest.value.height,
+              toHash: manifest.value.hash,
+              wrote,
+              replaced: Object.fromEntries(wrote.flatMap((dir) => (origins.get(dir) ? [[origins.get(dir)!, dir]] : []))),
+            })
+          )
+          .catch((e) => log.error({ err: e }, `${config.dataset}: the absorb got no receipt`))
       }
       await recordCoverage(store, config, factories, missingAddresses, maxAttempts)
       log.info(`absorbed ${missing.length} contracts and ${created.size} they created: ${absorbed} blocks into ${replaced.size + written.size} chunks`)

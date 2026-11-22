@@ -23,8 +23,9 @@ import {
   identityOf,
   Ledger,
   Receipt,
-  SCANS_FILE,
+  receiptId,
   ScanLog,
+  scansFile,
 } from './receipts'
 import { LakeDataset } from './serve/lake'
 import { parseQuery } from './serve/query'
@@ -124,7 +125,10 @@ async function lake(t: TestContext) {
 }
 
 const manifestOf = async (store: Store) => (await store.read<Manifest>(MANIFEST_FILE))!.value
-const ledgerOf = async (store: Store) => (await store.read<Ledger>(SCANS_FILE))?.value
+const ledgerOf = async (store: Store) => {
+  const lakeId = (await store.read<Coverage>(COVERAGE_FILE))?.value.lakeId
+  return lakeId ? (await store.read<Ledger>(scansFile(lakeId)))?.value : undefined
+}
 const loadFilter = (store: Store) => async (digest: string) => (await store.read<FilterObject>(filterFile(digest)))?.value
 
 async function claimsAt(store: Store, identity: Identity, snapshot?: Manifest) {
@@ -237,12 +241,37 @@ test('an absorb that found no log proves its address for any snapshot at its hei
   assert.equal((await claimsAt(store, identity, m0)).from.get(Y), 0)
 })
 
-test('an absorb whose read ended on another hash than the lake holds gets no receipt', async (t) => {
+/** The manifest, coverage and ledger, to tell that a refused absorb published nothing. */
+const published = async (store: Store) => ({
+  manifest: await manifestOf(store),
+  coverage: (await store.read<Coverage>(COVERAGE_FILE))!.value,
+  ledger: await ledgerOf(store),
+})
+
+test('an absorb whose read ended on another hash than the lake holds publishes nothing', async (t) => {
   const { dir, store, identity } = await lake(t)
-  const receipts = (await ledgerOf(store))!.receipts.length
-  await absorbing(dir, store, identity, gaining({ name: 'Y', address: Y }), rpcSeeing((n) => (n === 50 ? '0xother' : `0x${n}`)))
-  assert.equal((await ledgerOf(store))!.receipts.length, receipts)
-  assert.equal((await claimsAt(store, identity)).from.has(Y), false)
+  const before = await published(store)
+  await assert.rejects(absorbing(dir, store, identity, gaining({ name: 'Y', address: Y }), rpcSeeing((n) => (n === 50 ? '0xother' : `0x${n}`))), /nothing was absorbed/)
+  assert.deepEqual(await published(store), before)
+})
+
+test('an absorb whose first read ended on another hash is not saved by an extension that matches', async (t) => {
+  const { dir, store, identity } = await lake(t)
+  let moved = false
+  const base = rpcSeeing((n) => (n === 50 ? '0xother' : `0x${n}`))
+  const racing: FetchHistory = async (...args) => {
+    if (!moved) {
+      moved = true
+      const current = (await store.read<Manifest>(MANIFEST_FILE))!
+      await store.write<Manifest>(MANIFEST_FILE, { ...current.value, height: 60, hash: '0x60' }, current.version)
+    }
+    return base(...args)
+  }
+  const before = await published(store)
+  await assert.rejects(absorbing(dir, store, identity, gaining({ name: 'Y', address: Y }), racing), /nothing was absorbed/)
+  const after = await published(store)
+  assert.deepEqual([after.manifest.chunks, after.coverage, after.ledger], [before.manifest.chunks, before.coverage, before.ledger])
+  assert.equal(after.manifest.height, 60, 'only the follower moved the lake')
 })
 
 test('an absorb retried after the lake moved credits a child it found in the extension only for the extension', async (t) => {
@@ -336,7 +365,7 @@ test('a receipt written while another process writes the ledger is added to what
     read: (name) => store.read(name),
     version: (name) => store.version(name),
     async write(name, value, version) {
-      if (name === SCANS_FILE && !raced) {
+      if (name === scansFile(identity.lakeId) && !raced) {
         raced = true
         await appendReceipt(store, identity, ry)
       }
@@ -361,7 +390,10 @@ test('a filter that only grew is written as what it added, and proves its new ad
   assert.equal(await filters.digest([A, X]), grown)
 
   const identity: Identity = { dataset: DATASET, chainId: 1, lakeId: 'lake' }
-  const commit = (from: number, to: number, filter: string) => ({ id: `${from}`, kind: 'commit' as const, source: 'rpc' as const, segments: [{ from, to, filter }], to, toHash: `0x${to}`, wrote: [], replaced: {} })
+  const commit = (from: number, to: number, filter: string) => {
+    const receipt: Receipt = { kind: 'commit', source: 'rpc', segments: [{ from, to, filter }], to, toHash: `0x${to}`, wrote: [], replaced: {} }
+    return { id: receiptId(identity, receipt), ...receipt }
+  }
   const ledger: Ledger = { schemaVersion: 1, ...identity, receipts: [commit(0, 20, first), commit(21, 50, grown)] }
   const proven = await claims({ height: 50, hash: '0x50', chunks: [] }, ledger, identity, loadFilter(store))
   assert.equal(proven.from.get(A), 0)
@@ -381,15 +413,31 @@ test('a ledger of another lake or schema, or a filter that is missing or does no
   assert.equal(await none(ledger), 1)
 })
 
-test('the receipts of a lake rebuilt at the same location are started over', async (t) => {
+test('a late receipt of the lake a rebuild replaced lands in that lake’s ledger, never in the new one', async (t) => {
   const { store, identity } = await lake(t)
-  const stale = (await store.read<Ledger>(SCANS_FILE))!
-  await store.write<Ledger>(SCANS_FILE, { ...stale.value, lakeId: 'the lake before' }, stale.version)
+  const before = (await ledgerOf(store))!.receipts
   const filters = new Filters(store)
-  await appendReceipt(store, identity, { kind: 'commit', source: 'rpc', segments: [{ from: 51, to: 60, filter: await filters.digest([A]) }], to: 60, toHash: '0x60', wrote: [], replaced: {} })
+  const late: Receipt = { kind: 'commit', source: 'rpc', segments: [{ from: 51, to: 60, filter: await filters.digest([X]) }], to: 60, toHash: '0x60', wrote: [], replaced: {} }
+  await appendReceipt(store, { ...identity, lakeId: 'the lake before' }, late)
+  assert.deepEqual((await ledgerOf(store))!.receipts, before)
+  assert.equal((await claimsAt(store, identity)).from.get(A), 0)
+  // A ledger naming another chain is refused, and left as it was.
+  await assert.rejects(appendReceipt(store, { ...identity, chainId: 137 }, late), /not to chain 137/)
+  assert.deepEqual((await ledgerOf(store))!.receipts, before)
+})
+
+test('a receipt altered after it was written, or one that is not a receipt, proves nothing, and leaves the others usable', async (t) => {
+  const { store, identity } = await lake(t)
   const ledger = (await ledgerOf(store))!
-  assert.equal(ledger.lakeId, identity.lakeId)
-  assert.deepEqual(ledger.receipts.map((r) => r.to), [60])
+  const elsewhere = await new Filters(store).digest([X])
+  const [first, second, third] = ledger.receipts
+  // The last commit now says it read X, under the id it was written with.
+  const altered = { ...third, segments: [{ ...third.segments[0], filter: elsewhere }] }
+  const stored = { ...ledger, receipts: [first, null, { ...second, segments: [null] }, second, altered] } as unknown as Ledger
+  const proven = await claims(await manifestOf(store), stored, identity, loadFilter(store))
+  assert.equal(proven.from.has(X), false)
+  assert.deepEqual(proven.finalized, { number: 40, hash: '0x40' }, 'the altered receipt counts for nothing')
+  assert.equal(proven.from.get(A), 0, 'and the receipts that verify still prove A')
 })
 
 test('a lake is named once, and keeps its name', async (t) => {
@@ -457,6 +505,10 @@ test('a chunk a later absorb rewrote again still witnesses the first absorb', as
   const proven = await claimsAt(store, identity, afterZ)
   assert.deepEqual([proven.from.get(X), proven.from.get(Z)], [0, 0])
   assert.equal((await claimsAt(store, identity, afterX)).from.has(Z), false)
+  // A replacement link only counts from a receipt that verifies.
+  const ledger = (await ledgerOf(store))!
+  const forged = ledger.receipts.map((r) => (r.id === second.id ? { ...r, replaced: { ...r.replaced, [first.wrote[0]]: 'a folder no snapshot lists' } } : r))
+  assert.equal((await claims(afterZ, { ...ledger, receipts: forged }, identity, loadFilter(store))).from.has(X), false)
 })
 
 test('a ledger this build cannot write leaves the commit published, without a receipt', async (t) => {
@@ -464,13 +516,13 @@ test('a ledger this build cannot write leaves the commit published, without a re
   const store = openStore(dir, DATASET)
   await store.write<Coverage>(COVERAGE_FILE, { contracts: [A] }, null)
   const identity = await identityOf(store, config)
-  await store.write(SCANS_FILE, { schemaVersion: 2, ...identity, receipts: [] }, null)
+  await store.write(scansFile(identity.lakeId), { schemaVersion: 2, ...identity, receipts: [] }, null)
   const errors: string[] = []
   const log = { ...quiet, error: (_: unknown, message: string) => void errors.push(message) } as unknown as Logger
   const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64, receipts: { identity, source: 'rpc', lowerBound: 0, scans: ScanLog.constant([A]), filters: new Filters(store), log } })
   await db.connect()
   await db.transact(tx(-1, 20), async (s) => s.setForceFlush(true))
   assert.equal((await manifestOf(store)).height, 20)
-  assert.equal((await store.read<{ schemaVersion: number }>(SCANS_FILE))!.value.schemaVersion, 2, 'left as it was')
+  assert.equal((await store.read<{ schemaVersion: number }>(scansFile(identity.lakeId)))!.value.schemaVersion, 2, 'left as it was')
   assert.deepEqual(errors, ['blocks to 20 got no receipt'])
 })

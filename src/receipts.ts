@@ -18,8 +18,10 @@ import { Conflict, Store } from './store'
  * The receipts say nothing about the configured contracts or the registry: an address is held over a
  * segment only when that segment's own filter asked for it.
  */
-export const SCANS_FILE = 'scans.json'
 export const SCANS_SCHEMA = 1
+
+/** Each lake's receipts in a file of its own, so a writer of a lake rebuilt at the same location never touches the new one's. */
+export const scansFile = (lakeId: string) => `scans-${lakeId}.json`
 
 export const filterFile = (digest: string) => `filter-${digest}.json`
 
@@ -215,27 +217,31 @@ export async function segmentsOf(filters: Filters, reads: Read[]): Promise<Segme
 }
 
 /**
- * Adds a receipt to the ledger, once: a ledger another process changed meanwhile is read again and the
- * receipt added to it. A ledger of another lake (one rebuilt at the same location) is started over; one
- * of a schema this build does not know is left alone, and the receipt is not written.
+ * Adds a receipt to its lake's ledger, once: a ledger another process changed meanwhile is read again and
+ * the receipt added to it. A ledger that names another dataset or chain, or a schema this build does not
+ * know, is left alone and the receipt is not written.
  */
 export async function appendReceipt(store: Store, identity: Identity, receipt: Receipt, attempts = 10): Promise<void> {
+  const file = scansFile(identity.lakeId)
   const id = receiptId(identity, receipt)
   for (let attempt = 0; attempt < attempts; attempt++) {
-    const current = await store.read<Ledger>(SCANS_FILE)
+    const current = await store.read<Ledger>(file)
     if (current && current.value.schemaVersion !== SCANS_SCHEMA) {
-      throw new Error(`${identity.dataset}: ${SCANS_FILE} has schema ${current.value.schemaVersion}, which this build does not write`)
+      throw new Error(`${identity.dataset}: ${file} has schema ${current.value.schemaVersion}, which this build does not write`)
     }
-    const base: Ledger = current && sameLake(current.value, identity) ? current.value : { schemaVersion: SCANS_SCHEMA, ...identity, receipts: [] }
+    if (current && !sameLake(current.value, identity)) {
+      throw new Error(`${identity.dataset}: ${file} belongs to ${current.value.dataset} on chain ${current.value.chainId}, not to chain ${identity.chainId}`)
+    }
+    const base: Ledger = current?.value ?? { schemaVersion: SCANS_SCHEMA, ...identity, receipts: [] }
     if (base.receipts.some((r) => r.id === id)) return
     try {
-      await store.write<Ledger>(SCANS_FILE, { ...base, receipts: [...base.receipts, { id, ...receipt }] }, current?.version ?? null)
+      await store.write<Ledger>(file, { ...base, receipts: [...base.receipts, { id, ...receipt }] }, current?.version ?? null)
       return
     } catch (e) {
       if (!(e instanceof Conflict)) throw e
     }
   }
-  throw new Error(`${identity.dataset}: ${SCANS_FILE} kept changing while recording a receipt`)
+  throw new Error(`${identity.dataset}: ${file} kept changing while recording a receipt`)
 }
 
 /** What a snapshot of the lake can prove: up to which block, and from which block for each address. */
@@ -248,15 +254,33 @@ export interface Claims {
 
 const NONE: Claims = { from: new Map() }
 
-const wellFormed = (r: Receipt) =>
-  Number.isSafeInteger(r.to) &&
-  typeof r.toHash === 'string' &&
-  Array.isArray(r.wrote) &&
-  r.replaced !== null &&
-  typeof r.replaced === 'object' &&
-  Array.isArray(r.segments) &&
-  r.segments.length > 0 &&
-  r.segments.every((s) => Number.isSafeInteger(s.from) && Number.isSafeInteger(s.to) && s.from >= 0 && s.from <= s.to && s.to <= r.to && typeof s.filter === 'string')
+const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+const isBlock = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+
+/** A stored receipt as it was written, or undefined when its JSON is not a receipt. */
+function parseReceipt(raw: unknown): Receipt | undefined {
+  if (!isRecord(raw)) return undefined
+  const { kind, source, segments, to, toHash, wrote, replaced } = raw
+  if ((kind !== 'commit' && kind !== 'absorb') || (source !== 'rpc' && source !== 'sqd-portal')) return undefined
+  if (!isBlock(to) || typeof toHash !== 'string') return undefined
+  if (!Array.isArray(wrote) || !wrote.every((dir) => typeof dir === 'string')) return undefined
+  if (!isRecord(replaced) || !Object.values(replaced).every((dir) => typeof dir === 'string')) return undefined
+  if (!Array.isArray(segments) || segments.length === 0) return undefined
+  const parsed: Segment[] = []
+  for (const s of segments) {
+    if (!isRecord(s) || !isBlock(s.from) || !isBlock(s.to) || typeof s.filter !== 'string' || s.from > s.to || s.to > to) return undefined
+    parsed.push({ from: s.from, to: s.to, filter: s.filter })
+  }
+  return { kind, source, segments: parsed, to, toHash, wrote: [...wrote] as string[], replaced: { ...(replaced as Record<string, string>) } }
+}
+
+/** The ledger's receipts whose JSON parses and whose id is the digest of what they say, for the lake expected. */
+function verifiedReceipts(ledger: Ledger, expected: Identity): Receipt[] {
+  return ledger.receipts.flatMap((raw) => {
+    const receipt = parseReceipt(raw)
+    return receipt && isRecord(raw) && raw.id === receiptId(expected, receipt) ? [receipt] : []
+  })
+}
 
 /**
  * What `snapshot` proves from `ledger`. A receipt counts for the snapshot only if the snapshot holds its
@@ -271,7 +295,8 @@ const wellFormed = (r: Receipt) =>
  *
  * An address is proven from the first block of the longest run of blocks ending at the highest proven
  * block that the segments asking for it cover without a gap. A ledger of another lake or schema, a
- * receipt that does not parse, and a filter that is missing or does not match its digest prove nothing.
+ * receipt that does not parse or whose id is not the digest of what it says, and a filter that is
+ * missing or does not match its digest prove nothing.
  */
 export async function claims(
   snapshot: Manifest,
@@ -279,8 +304,9 @@ export async function claims(
   expected: Identity,
   loadFilter: (digest: string) => Promise<FilterObject | undefined>
 ): Promise<Claims> {
-  if (!ledger || ledger.schemaVersion !== SCANS_SCHEMA || !sameLake(ledger, expected) || !Array.isArray(ledger.receipts)) return NONE
-  const receipts = ledger.receipts.filter(wellFormed)
+  if (!isRecord(ledger) || ledger.schemaVersion !== SCANS_SCHEMA || !sameLake(ledger, expected) || !Array.isArray(ledger.receipts)) return NONE
+  // Only a receipt whose id matches what it says feeds the replacements and the claims.
+  const receipts = verifiedReceipts(ledger, expected)
 
   const listed = new Set(snapshot.chunks.map((c) => c.dir))
   const replacedBy = new Map<string, string[]>()
