@@ -284,10 +284,15 @@ export async function appendReceipt(store: Store, identity: Identity, receipt: R
 
 /** What a snapshot of the lake can prove: up to which block, and from which block for each address. */
 export interface Claims {
-  /** The highest block the claims reach, with its hash; undefined when nothing is proven. */
+  /** The highest block the claims reach, with its hash; undefined when no receipt counts. */
   finalized?: { number: number; hash: string }
   /** For each address proven, the first block from which the lake holds every log of it up to `finalized`. */
   from: Map<string, number>
+  /**
+   * Set when a filter could not be read (as opposed to missing, or not matching its name): the claims
+   * may lack addresses a later read proves, so they are not to be kept.
+   */
+  unavailable?: boolean
 }
 
 const NONE: Claims = { from: new Map() }
@@ -376,10 +381,14 @@ export async function claims(
 
   // The filters, with their ancestors; a filter that cannot be read drops the segments that name it.
   const objects = new Map<string, FilterObject | null>()
+  let unavailable = false
   const load = async (digest: string): Promise<FilterObject | null> => {
     if (objects.has(digest)) return objects.get(digest)!
     objects.set(digest, null)
-    const object = await loadFilter(digest).catch(() => undefined)
+    const object = await loadFilter(digest).catch(() => {
+      unavailable = true
+      return undefined
+    })
     if (!object || !Array.isArray(object.add) || !object.add.every((a) => typeof a === 'string')) return null
     if ((object.parent !== undefined && typeof object.parent !== 'string') || digestOf(object) !== digest) return null
     if (object.parent !== undefined && !(await load(object.parent))) return null
@@ -425,7 +434,7 @@ export async function claims(
     const start = startOf.get(key)
     if (start !== undefined) from.set(address, start)
   }
-  return { finalized, from }
+  return unavailable ? { finalized, from, unavailable } : { finalized, from }
 }
 
 function mergeIntervals(intervals: [number, number][]): [number, number][] {

@@ -1,5 +1,6 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http'
 import { createLogger } from '@subsquid/logger'
+import type { ContractsAnswer } from './contracts'
 import { BlockHeader } from './headers'
 import { LogRow, Page, TransactionRow } from './lake'
 import { BadQuery, EvmQuery, parseQuery } from './query'
@@ -19,6 +20,8 @@ export interface ChainView {
   page(query: EvmQuery, from: number, to: number): Promise<Page>
   /** Blocks above the finalized head, for `stream`; absent when only finalized blocks are served. */
   hot?: HotView
+  /** From which block the lake holds every log of each address; a view without it answers 503. */
+  contracts?: () => Promise<ContractsAnswer>
 }
 
 export interface HotView {
@@ -93,12 +96,17 @@ export function createPortal(view: Views, health?: () => Health, options: Portal
 }
 
 async function answer(view: Views, req: IncomingMessage, res: ServerResponse, wait: { ms: number; pollMs: number }) {
-  const match = req.url?.match(/^\/datasets\/([^/]+)\/(stream|finalized-stream|head|finalized-head)\/?$/)
+  const match = req.url?.match(/^\/datasets\/([^/]+)\/(stream|finalized-stream|head|finalized-head|contracts)\/?$/)
   if (!match) return send(res, 404, { error: 'not found' })
   const [, name, endpoint] = match
   const chain = /^[a-z0-9-]+$/.test(name) ? await view(name) : undefined
   if (!chain) return send(res, 404, { error: `unknown dataset ${name}` })
 
+  if (endpoint === 'contracts') {
+    if (req.method !== 'GET') return send(res, 405, { error: 'use GET' })
+    if (!chain.contracts) throw new NotReady(`${name}: its coverage is not stated yet`)
+    return send(res, 200, await chain.contracts())
+  }
   if (endpoint === 'head' || endpoint === 'finalized-head') {
     if (req.method !== 'GET') return send(res, 405, { error: 'use GET' })
     const finalized = await chain.head()
@@ -171,7 +179,9 @@ async function answer(view: Views, req: IncomingMessage, res: ServerResponse, wa
     page = await chain.page(query, query.fromBlock, end)
   }
   if (await forked()) return answerFork()
-  res.writeHead(200, { 'content-type': 'application/x-ndjson', ...headHeaders(finalized, latest) })
+  // A page read from the lake's files names the manifest it was read from, as a coverage answer does.
+  const revision: Record<string, string> = page.revision ? { 'x-lake-coverage-revision': page.revision } : {}
+  res.writeHead(200, { 'content-type': 'application/x-ndjson', ...headHeaders(finalized, latest), ...revision })
   for (const line of blockLines(query, page.upper, page.headers, page.logs, page.transactions)) res.write(line + '\n')
   res.end()
 }

@@ -1,6 +1,7 @@
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
 import { createLogger } from '@subsquid/logger'
 import { Chunk, Manifest, MANIFEST_FILE } from '../manifest'
+import { digestOf } from '../receipts'
 import { openStore, Store } from '../store'
 import { BlockHeader, headerFromRpc, Upstream } from './headers'
 import { EvmQuery, logCondition } from './query'
@@ -37,6 +38,23 @@ export interface Page {
   logs: LogRow[]
   transactions: TransactionRow[]
   headers: Map<number, BlockHeader>
+  /** The revision of the manifest a page from the lake's files was read from; see `revisionOf`. */
+  revision?: string
+}
+
+const revisions = new WeakMap<Manifest, string>()
+
+/**
+ * The revision of a manifest: the digest of its height, hash and chunks. Two pages, or a page and a
+ * coverage answer, with one revision were read from the same files. It names data, not a response.
+ */
+export function revisionOf(manifest: Manifest): string {
+  let revision = revisions.get(manifest)
+  if (!revision) {
+    revision = digestOf({ height: manifest.height, hash: manifest.hash, chunks: manifest.chunks.map((c) => ({ dir: c.dir, from: c.from, to: c.to })) })
+    revisions.set(manifest, revision)
+  }
+  return revision
 }
 
 function num(value: unknown): number {
@@ -129,6 +147,16 @@ export const PAGE_BUDGET_MS = 5_000
  */
 export class LakeDataset {
   private manifest?: Manifest & { readAt: number }
+  /** Logs a page holds at most; a block with more is served whole on its own. */
+  maxLogs = MAX_LOGS
+  /** How long a manifest read is reused before it is read again. */
+  manifestTtlMs = MANIFEST_TTL_MS
+  /**
+   * Whether a manifest read never takes the lake back to a lower height. A live view needs it: its writer
+   * installs each commit, and a read that started before it must not undo it. A static view does not: a
+   * lake restored there from an older copy is served at that copy's height once the manifest is read again.
+   */
+  monotonic = true
 
   private constructor(
     readonly dataset: string,
@@ -168,15 +196,20 @@ export class LakeDataset {
     return result
   }
 
+  /** What the lake holds now: one manifest, which a caller reading several things keeps for all of them. */
+  snapshot(): Promise<Manifest> {
+    return this.current()
+  }
+
   /** What the lake holds, from its manifest. */
   private async current(): Promise<Manifest> {
-    if (!this.manifest || Date.now() - this.manifest.readAt > MANIFEST_TTL_MS) {
+    if (!this.manifest || Date.now() - this.manifest.readAt > this.manifestTtlMs) {
       const read = await this.store.read<Manifest>(MANIFEST_FILE)
       if (!read) throw new Error(`${this.dataset}: the lake has no manifest yet`)
       const bad = read.value.chunks.find((c) => !CHUNK_DIR.test(c.dir))
       if (bad) throw new Error(`${this.dataset}: the manifest lists an invalid chunk folder "${bad.dir}"`)
       // The lake only grows. A read that started before the writer's last commit must not take it back.
-      if (!this.manifest || read.value.height >= this.manifest.height) this.manifest = { ...read.value, readAt: Date.now() }
+      if (!this.manifest || !this.monotonic || read.value.height >= this.manifest.height) this.manifest = { ...read.value, readAt: Date.now() }
       else this.manifest.readAt = Date.now()
     }
     return this.manifest
@@ -211,9 +244,9 @@ export class LakeDataset {
     return { number: height, hash }
   }
 
-  /** The chunks overlapping [from, to]. */
-  private async chunksIn(from: number, to: number): Promise<Chunk[]> {
-    return (await this.current()).chunks.filter((c) => c.to >= from && c.from <= to)
+  /** The chunks of `snapshot` overlapping [from, to]. */
+  private chunksOf(snapshot: Manifest, from: number, to: number): Chunk[] {
+    return snapshot.chunks.filter((c) => c.to >= from && c.from <= to)
   }
 
   private source(table: string, chunks: Chunk[]): string {
@@ -221,7 +254,12 @@ export class LakeDataset {
   }
 
   async header(number: number): Promise<BlockHeader> {
-    const chunks = await this.chunksIn(number, number)
+    return this.headerIn(await this.current(), number)
+  }
+
+  /** The header of `number` in `snapshot`'s files, or from the RPC when they lack it and it may be asked. */
+  private async headerIn(snapshot: Manifest, number: number): Promise<BlockHeader> {
+    const chunks = this.chunksOf(snapshot, number, number)
     const [row] = chunks.length
       ? await this.rows<Record<string, unknown>>(
           `SELECT number, hash, parent_hash, timestamp FROM ${this.source('blocks', chunks)} WHERE number = ${number}`
@@ -247,14 +285,18 @@ export class LakeDataset {
     this.rpcHeaders = true
   }
 
-  /** The logs, transactions and headers of the blocks in [from, to] that the query asks for. */
-  page(query: EvmQuery, from: number, to: number): Promise<Page> {
-    return this.read(query, from, to, true)
+  /**
+   * The logs, transactions and headers of the blocks in [from, to] that the query asks for, all from
+   * one manifest, whose revision the page carries.
+   */
+  async page(query: EvmQuery, from: number, to: number): Promise<Page> {
+    const snapshot = await this.current()
+    return { ...(await this.read(snapshot, query, from, to, true)), revision: revisionOf(snapshot) }
   }
 
-  private async read(query: EvmQuery, from: number, to: number, capped: boolean): Promise<Page> {
-    const inRange = await this.chunksIn(from, to)
-    if (query.logs.length === 0 || inRange.length === 0) return { upper: await this.header(to), logs: [], transactions: [], headers: new Map() }
+  private async read(snapshot: Manifest, query: EvmQuery, from: number, to: number, capped: boolean): Promise<Page> {
+    const inRange = this.chunksOf(snapshot, from, to)
+    if (query.logs.length === 0 || inRange.length === 0) return { upper: await this.headerIn(snapshot, to), logs: [], transactions: [], headers: new Map() }
     const matches = query.logs.map(logCondition).join(' OR ')
     const withTransaction = query.logs.filter((r) => r.transaction).map(logCondition).join(' OR ') || 'FALSE'
 
@@ -269,28 +311,28 @@ export class LakeDataset {
       const rows = await this.rows<Record<string, unknown>>(
         `SELECT *, (${withTransaction}) AS with_transaction FROM ${this.source('logs', [chunk])}
          WHERE block_number BETWEEN ${Math.max(from, chunk.from)} AND ${end} AND (${matches})
-         ORDER BY block_number, log_index${capped ? ` LIMIT ${MAX_LOGS + 1 - logs.length}` : ''}`
+         ORDER BY block_number, log_index${capped ? ` LIMIT ${this.maxLogs + 1 - logs.length}` : ''}`
       )
       logs = logs.concat(
         rows.map((r) => ({ ...r, block_number: num(r.block_number), log_index: num(r.log_index), transaction_index: num(r.transaction_index) }) as LogRow)
       )
-      if (capped && logs.length > MAX_LOGS) break
+      if (capped && logs.length > this.maxLogs) break
       if (end < to && Date.now() - started >= PAGE_BUDGET_MS) {
         upper = end
         break
       }
     }
 
-    if (capped && logs.length > MAX_LOGS) {
+    if (capped && logs.length > this.maxLogs) {
       // Stop before the last block, which may be cut short, unless it is the only one.
-      const last = logs[MAX_LOGS].block_number
+      const last = logs[this.maxLogs].block_number
       const complete = logs.filter((l) => l.block_number < last)
       if (complete.length > 0) {
         logs = complete
         upper = last - 1
       } else {
         // One block holds more than a page: it is served whole, since a block is never split.
-        return this.read(query, last, last, false)
+        return this.read(snapshot, query, last, last, false)
       }
     }
 
@@ -317,6 +359,6 @@ export class LakeDataset {
         .filter((t) => wanted.has(`${t.block_number}:${t.transaction_index}`))
     }
 
-    return { upper: headers.get(upper) ?? (await this.header(upper)), logs, transactions, headers }
+    return { upper: headers.get(upper) ?? (await this.headerIn(snapshot, upper)), logs, transactions, headers }
   }
 }
