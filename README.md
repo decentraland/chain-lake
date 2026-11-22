@@ -75,8 +75,16 @@ block the lake holds every log of an address, without trusting the config or `co
   rebuilt from `discover` gets a new one, so a late writer of the lake it replaced never touches the new
   ledger. A backfill or a development follow refuses to start a lake from nothing where the coverage
   still names one (its manifest gone): start it in an empty location. A lake restored from a copy needs
-  the ledger and filters of that same copy, or none; take a static `serve` offline while a lake is
-  restored in place, or switch a complete copy in at once.
+  the ledger and filters of that same copy, or none.
+
+**Restoring or replacing a lake.** Before a lake's location is restored from a copy or replaced by
+another lake, even by switching a complete copy in at once, stop every process that writes it (`live`,
+`follow`, `backfill`, `absorb`) and let it finish. Writers stay bound to the location they started on
+for as long as they publish: switching it under a running writer is not supported. The checks the
+writers make (a commit's receipt only while the manifest is the one it published, an absorb's lake
+pinned before it publishes and before it records coverage) catch some such switches, not all. Readers
+are a separate matter: take a static `serve` offline while a lake is restored in place, or switch a
+complete copy in at once.
 
 Each dataset's config names its `chainId`. `live`, `follow` and `absorb` refuse an RPC endpoint that
 serves another chain, and `backfill` refuses a portal whose finalized block differs from the RPC's at

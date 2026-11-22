@@ -83,8 +83,9 @@ export async function absorb(options: {
   if (missing.length === 0) return
   if (!(await store.read(MANIFEST_FILE)) || !(await store.read(REGISTRY_FILE))) throw new Error(`${config.dataset}: the lake has no manifest or registry`)
   // The lake this absorb works on, pinned before any history is read, and named (if it is not yet) only
-  // now that it is known complete. Another lake switched in at this location ends the absorb, whatever
-  // its height: nothing read for this one is published to it.
+  // now that it is known complete. It is checked again before each publication and before coverage is
+  // recorded, which catches some lakes switched in under a running absorb; switching a lake under any
+  // running writer is outside what is supported (see the README on restoring a lake).
   const identity: Identity | undefined = options.receipts && (await resolveIdentity(options.receipts.identity))
   const lakeId = identity?.lakeId ?? coverage.value.lakeId
   const sameLake = async () => {
@@ -221,7 +222,7 @@ export async function absorb(options: {
         next.push(chunk)
       }
 
-      // Nothing is published to a lake switched in while this one was read.
+      // A lake switched in while this one was read is not published to (a switch after this check is not caught).
       await sameLake()
       const known = new Set(registry.value.contracts.map((c) => c.address))
       const children = [...created.values()].sort((x, y) => x.createdAt!.block - y.createdAt!.block || x.createdAt!.logIndex - y.createdAt!.logIndex)
