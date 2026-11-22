@@ -236,8 +236,9 @@ export async function appendReceipt(store: Store, identity: Identity, receipt: R
     const base: Ledger = current?.value ?? { schemaVersion: SCANS_SCHEMA, ...identity, receipts: [] }
     // Only an entry that verifies under this id is this receipt; one that does not parse is passed over.
     const present = base.receipts.some((raw) => {
+      if (!isRecord(raw) || raw.id !== id) return false
       const parsed = parseReceipt(raw)
-      return parsed !== undefined && isRecord(raw) && raw.id === id && receiptId(identity, parsed) === id
+      return parsed !== undefined && receiptId(identity, parsed) === id
     })
     if (present) return
     try {
