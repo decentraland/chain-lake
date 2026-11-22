@@ -1,5 +1,6 @@
 {
   "dataset": "polygon-mainnet",
+  "chainId": 137,
   "fromBlock": 0,
   "contracts": [
     {

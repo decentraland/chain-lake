@@ -1,10 +1,14 @@
 import { run } from '@subsquid/batch-processor'
 import { DataSourceBuilder } from '@subsquid/evm-stream'
 import { createLogger } from '@subsquid/logger'
+import { checkPortalChain } from './chain'
 import { blockFromEnv, loadConfig, required } from './config'
 import { checkCoverage, markPartial, readCoverage } from './coverage'
 import { followedAddresses, Registry, REGISTRY_FILE } from './discover'
+import { RpcClient } from './follow/rpc'
 import { portalSource } from './portal'
+import { Filters, identityOf, ScanLog } from './receipts'
+import { rpcUrl } from './serve/headers'
 import { openStore } from './store'
 import { writeBlocks } from './write'
 import { openWriter } from './writer'
@@ -33,9 +37,15 @@ async function main() {
     checkCoverage(config, coverage)
   }
 
+  // What it reads is receipted as this dataset's: a portal serving another chain stops it here.
+  const source = new DataSourceBuilder().setPortal(portalSource(config.dataset)).build()
+  await checkPortalChain(await source.getFinalizedHead(), new RpcClient(rpcUrl(config.dataset)), config, logger)
+  const identity = await identityOf(store, config)
+  const lowerBound = from ?? config.fromBlock
+
   const builder = new DataSourceBuilder()
     .setPortal(portalSource(config.dataset))
-    .setBlockRange({ from: from ?? config.fromBlock, to })
+    .setBlockRange({ from: lowerBound, to })
     .setFields({
       block: { timestamp: true, parentHash: true },
       log: { address: true, topics: true, data: true, transactionHash: true },
@@ -45,7 +55,11 @@ async function main() {
   // request with every address, a few hundred KB on Polygon, which the shared SQD portal accepts.
   builder.addLog({ where: { address: addresses }, include: { transaction: true } })
 
-  const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64) })
+  // Every block from the lower bound on is read with the one filter above, from the SQD portal.
+  const db = openWriter(lakeDest, config.dataset, store, {
+    chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
+    receipts: { identity, source: 'sqd-portal', lowerBound, scans: ScanLog.constant(addresses), filters: new Filters(store), log: logger },
+  })
 
   logger.info(`backfilling ${addresses.length} contracts of ${config.dataset} up to block ${to}`)
   run(builder.build(), db, async (ctx) => {

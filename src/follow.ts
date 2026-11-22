@@ -1,11 +1,13 @@
 import { run } from '@subsquid/batch-processor'
 import { createLogger } from '@subsquid/logger'
+import { checkRpcChain } from './chain'
 import { blockFromEnv, loadConfig, required } from './config'
-import { markPartial } from './coverage'
+import { markPartial, readCoverage } from './coverage'
 import { openRegistry } from './discover'
 import { RpcClient } from './follow/rpc'
 import { RpcSource } from './follow/source'
 import { Manifest, MANIFEST_FILE } from './manifest'
+import { Filters, identityOf, ScanLog } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { openStore } from './store'
 import { writeBlocks } from './write'
@@ -38,15 +40,25 @@ async function main() {
   // The lake's state first, then the registry, as in live: the writer starts from exactly that state.
   const pinned = (await store.read<Manifest>(MANIFEST_FILE))!
   const { registry, save } = await openRegistry(store)
-  const source = new RpcSource(new RpcClient(rpcUrl(config.dataset)), config, registry, save, {
+  const rpc = new RpcClient(rpcUrl(config.dataset))
+  await checkRpcChain(rpc, config, logger)
+  // A lake no coverage record names (a development lake from block 0) gets no receipts.
+  const identity = (await readCoverage(store)) ? await identityOf(store, config) : undefined
+  const scans = ScanLog.reading()
+  const source = new RpcSource(rpc, config, registry, save, {
     maxRange: Number(process.env.MAX_RANGE || 2000),
     addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
     pollMs: Number(process.env.POLL_MS || 5000),
     // STOP_BLOCK bounds a run, for comparisons; without it the follower keeps up with the chain.
     stopBlock: stop,
+    scans,
   })
 
-  const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64), startAt: pinned.version })
+  const db = openWriter(lakeDest, config.dataset, store, {
+    chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
+    startAt: pinned.version,
+    receipts: identity && { identity, source: 'rpc', lowerBound: pinned.value.height + 1, scans, filters: new Filters(store), log: logger },
+  })
 
   logger.info(`following ${config.dataset}: ${registry.contracts.length} contracts, registry at block ${registry.height}`)
   run(source, db, async (ctx) => {

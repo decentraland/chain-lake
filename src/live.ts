@@ -5,6 +5,7 @@ import { createLogger } from '@subsquid/logger'
 import { DatasetConfig, datasetsFromEnv, loadConfig, required } from './config'
 import { missingContracts } from './absorb'
 import { bootstrap } from './bootstrap'
+import { checkRpcChain } from './chain'
 import { readCoverage } from './coverage'
 import { openRegistry } from './discover'
 import { HotChain } from './live/hot'
@@ -15,6 +16,7 @@ import { NodeBehind } from './follow/fetch'
 import { RpcClient } from './follow/rpc'
 import { RpcSource } from './follow/source'
 import { Manifest, MANIFEST_FILE } from './manifest'
+import { Filters, identityOf, ScanLog } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { LakeDataset } from './serve/lake'
 import { createPortal, NotReady } from './serve/server'
@@ -164,11 +166,16 @@ async function follow(lakeDest: string, store: Store, dataset: string, config: D
   const lake = await LakeDataset.open(lakeDest, dataset)
   // A lake the portal cannot read would otherwise be served as a 503 on every request.
   await lake.check()
+  // What it reads is receipted as this dataset's: an RPC serving another chain stops it here.
+  const identity = await identityOf(store, config)
+  await checkRpcChain(rpc, config, log)
 
+  const scans = ScanLog.reading()
   const source = new RpcSource(rpc, config, registry, save, {
     maxRange: Number(process.env.MAX_RANGE || 2000),
     addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
     pollMs: Number(process.env.POLL_MS || 5000),
+    scans,
   })
 
   // Each commit is told to the portal: the lake learns it first, so the blocks the tail lets go of
@@ -176,6 +183,7 @@ async function follow(lakeDest: string, store: Store, dataset: string, config: D
   const db = openWriter(lakeDest, dataset, store, {
     chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
     startAt: pinned.version,
+    receipts: { identity, source: 'rpc', lowerBound: pinned.value.height + 1, scans, filters: new Filters(store), log },
     onCommit(committed) {
       lake.setWritten(committed)
       tail.written({ height: committed.height, hash: committed.hash })

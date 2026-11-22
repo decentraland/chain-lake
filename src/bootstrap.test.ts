@@ -10,7 +10,7 @@ import { REGISTRY_FILE } from './discover'
 import { MANIFEST_FILE } from './manifest'
 import { openStore, Store } from './store'
 
-const config: DatasetConfig = { dataset: 'polygon-mainnet', fromBlock: 0, contracts: [{ name: 'Static', address: '0x' + 'aa'.repeat(20) }], factories: [] }
+const config: DatasetConfig = { dataset: 'polygon-mainnet', chainId: 137, fromBlock: 0, contracts: [{ name: 'Static', address: '0x' + 'aa'.repeat(20) }], factories: [] }
 
 /** A store in a fresh directory, and stand-ins for discover and backfill that record their runs. */
 async function setup(t: TestContext, prepare: (store: Store) => Promise<void>, backfillTo = 100) {

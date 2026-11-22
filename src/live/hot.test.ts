@@ -71,6 +71,7 @@ class FakeChain {
 
 const config: DatasetConfig = {
   dataset: 'ethereum-mainnet',
+  chainId: 1,
   fromBlock: 0,
   contracts: [{ name: 'Static', address: STATIC }],
   factories: [{ name: 'Factory', address: FACTORY, fromBlock: 0, topic0: PROXY_CREATED, addressTopic: 1 }],

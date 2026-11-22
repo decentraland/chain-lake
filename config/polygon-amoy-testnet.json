@@ -1,5 +1,6 @@
 {
   "dataset": "polygon-amoy-testnet",
+  "chainId": 80002,
   "fromBlock": 0,
   "contracts": [
     {

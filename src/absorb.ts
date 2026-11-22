@@ -5,12 +5,14 @@ import { join } from 'path'
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
 import { TableSchema } from '@subsquid/file-store-parquet'
 import { createLogger, Logger } from '@subsquid/logger'
+import { checkRpcChain } from './chain'
 import { DatasetConfig, Factory, loadConfig, required } from './config'
 import { Coverage, COVERAGE_FILE, factoriesOf, readCoverage } from './coverage'
 import { configuredContracts, RegisteredContract, Registry, REGISTRY_FILE } from './discover'
 import { fetchFollowing } from './follow/fetch'
 import { RpcClient, untilAnswered } from './follow/rpc'
 import { Chunk, Manifest, MANIFEST_FILE } from './manifest'
+import { appendReceipt, Filters, Identity, identityOf, Read, segmentsOf } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { Conflict, openStore, Store } from './store'
 import { columns } from './tables'
@@ -65,6 +67,8 @@ export async function absorb(options: {
   maxAttempts?: number
   /** Where the new history is staged and DuckDB spills; a new temporary directory by default, removed after. A directory given here is the caller's to remove. */
   workDir?: string
+  /** Writes a receipt of what the absorb read once its publication wins; see `receipts.ts`. */
+  receipts?: { identity: Identity; filters: Filters }
 }): Promise<void> {
   const { lakeDest, config, store, fetch, maxRange } = options
   const concurrency = Math.max(1, options.concurrency ?? 1)
@@ -95,6 +99,11 @@ export async function absorb(options: {
   // The chunks written while reading, by the folder of the chunk each replaces.
   const replaced = new Map<string, Chunk>()
   const written = new Map<string, Chunk>()
+  // For the receipt: each range read with the addresses asked for, the hash each read observed at its
+  // last block, and each folder this run wrote with the folder it replaces (none in a gap).
+  const reads: Read[] = []
+  const observed = new Map<number, string>()
+  const origins = new Map<string, string | undefined>()
   const chunks = await ChunkFiles.open(lakeDest, config.dataset, join(work, 'duckdb')).catch((e) => {
     removeWork()
     throw e
@@ -112,6 +121,7 @@ export async function absorb(options: {
       if (!target.original || target.blocks.length === 0 || target.original.to > upTo) continue
       const chunk = folder(target.chunk)
       await chunks.write(chunk, target.original, staging.files(chunk.from, chunk.to))
+      origins.set(chunk.dir, target.original.dir)
       replaced.set(target.original.dir, chunk)
       staging.drop(chunk.from, chunk.to)
     }
@@ -140,6 +150,10 @@ export async function absorb(options: {
       const group = ranges.slice(i, i + concurrency)
       await inParallel(group, concurrency, async ([a, b]) => {
         const range = await fetch(followed, factories, a, b)
+        if (b === to) {
+          const end = range.blocks.find((block) => block.header.number === to)
+          if (end) observed.set(to, end.header.hash)
+        }
         const unknown = range.created.find((c) => !followed.has(c.address))
         if (unknown) throw new Error(`${config.dataset}: block ${unknown.createdAt?.block} creates ${unknown.address}, which reading the creations did not find`)
         absorbed += staging.add(a, b, range.blocks)
@@ -147,6 +161,7 @@ export async function absorb(options: {
       })
       await flush(existing, group[group.length - 1][1])
     }
+    reads.push({ from, to, addresses: [...followed] })
   }
 
   try {
@@ -178,6 +193,7 @@ export async function absorb(options: {
         if (!chunk) {
           chunk = folder(target.chunk)
           await chunks.write(chunk, target.original, staging.files(chunk.from, chunk.to))
+          origins.set(chunk.dir, target.original?.dir)
           written.set(key, chunk)
         }
         next.push(chunk)
@@ -193,6 +209,25 @@ export async function absorb(options: {
         if (!(e instanceof Conflict)) throw e
         log.info(`the lake moved while absorbing (attempt ${attempt + 1}); reading the new blocks too`)
         continue
+      }
+      if (options.receipts) {
+        const { height, hash } = manifest.value
+        const end = observed.get(height)
+        if (end === undefined || end.toLowerCase() !== hash.toLowerCase()) {
+          // The read was not on the branch the lake holds, so what it found (or did not) proves nothing.
+          log.error(`${config.dataset}: the read ended at block ${height} with hash ${end ?? 'unknown'}, and the lake holds ${hash}: no receipt`)
+        } else {
+          const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
+          await appendReceipt(store, options.receipts.identity, {
+            kind: 'absorb',
+            source: 'rpc',
+            segments: await segmentsOf(options.receipts.filters, reads),
+            to: height,
+            toHash: end,
+            wrote,
+            replaced: Object.fromEntries(wrote.flatMap((dir) => (origins.get(dir) ? [[origins.get(dir)!, dir]] : []))),
+          })
+        }
       }
       await recordCoverage(store, config, factories, missingAddresses, maxAttempts)
       log.info(`absorbed ${missing.length} contracts and ${created.size} they created: ${absorbed} blocks into ${replaced.size + written.size} chunks`)
@@ -413,10 +448,14 @@ async function main() {
   const store = openStore(lakeDest, config.dataset)
   const rpc = new RpcClient(rpcUrl(config.dataset))
   const perCall = Number(process.env.ADDRESSES_PER_CALL || 500)
+  // What it reads is receipted as this dataset's: an RPC serving another chain stops it here.
+  await checkRpcChain(rpc, config, logger)
+  const identity = await identityOf(store, config)
   await absorb({
     lakeDest,
     config,
     store,
+    receipts: { identity, filters: new Filters(store) },
     maxRange: Number(process.env.ABSORB_MAX_RANGE || 10_000),
     concurrency: Number(process.env.ABSORB_CONCURRENCY || 4),
     // RPC trouble is waited out however long it lasts, as the follower does: giving up would start the

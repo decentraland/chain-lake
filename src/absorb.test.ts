@@ -25,7 +25,7 @@ const EVENT = '0x' + '22'.repeat(32)
 const word = (address: string) => '0x' + '0'.repeat(24) + address.slice(2)
 
 const factory: Factory = { name: 'VestingFactory', address: FACTORY, fromBlock: 5, topic0: CREATED, addressTopic: 1, childName: 'vesting' }
-const before: DatasetConfig = { dataset: DATASET, fromBlock: 0, contracts: [{ name: 'Old', address: OLD }], factories: [] }
+const before: DatasetConfig = { dataset: DATASET, chainId: 1, fromBlock: 0, contracts: [{ name: 'Old', address: OLD }], factories: [] }
 const after: DatasetConfig = { ...before, factories: [factory] }
 
 type Log = { address: string; topics: string[]; tx: number }

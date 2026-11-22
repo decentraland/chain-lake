@@ -1,6 +1,7 @@
 import { createLogger } from '@subsquid/logger'
 import { DatasetConfig } from '../config'
 import { followedAddresses, Registry } from '../discover'
+import { ScanLog } from '../receipts'
 import { LakeBlock } from '../write'
 import { fetchFollowing, int, NodeBehind, RpcBlock } from './fetch'
 import { RpcClient, untilAnswered } from './rpc'
@@ -16,6 +17,8 @@ export interface FollowOptions {
   pollMs: number
   /** Stop after this block instead of following the chain, for bounded runs and comparisons. */
   stopBlock?: number
+  /** Told each range read, with the addresses asked for over the whole of it, for the commit receipts. */
+  scans?: ScanLog
 }
 
 /**
@@ -84,6 +87,9 @@ export class RpcSource {
       logger.info(`${this.config.dataset}: ${added.length} new contracts in blocks ${from}-${to}`)
     }
     this.registry.height = Math.max(this.registry.height, to)
+    // `fetchFollowing` asked for these over the whole range: the followed contracts, and the ones the
+    // range created, which it read again from the range's first block.
+    this.options.scans?.add(from, to, [...followed, ...created.map((c) => c.address)])
     return blocks
   }
 

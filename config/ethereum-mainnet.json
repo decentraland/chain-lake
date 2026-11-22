@@ -1,5 +1,6 @@
 {
   "dataset": "ethereum-mainnet",
+  "chainId": 1,
   "fromBlock": 4944642,
   "contracts": [
     {

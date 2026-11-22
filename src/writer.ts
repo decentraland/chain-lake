@@ -1,7 +1,9 @@
 import { randomBytes } from 'crypto'
 import { Database, Dest } from '@subsquid/file-store'
+import { Logger } from '@subsquid/logger'
 import { openDest } from './dest'
 import { Chunk, Manifest, MANIFEST_FILE } from './manifest'
+import { appendReceipt, Filters, Identity, ScanLog, ScanSource, segmentsOf } from './receipts'
 import { Conflict, Store, Versioned } from './store'
 import { tables } from './tables'
 
@@ -31,6 +33,8 @@ export function openWriter(
      */
     startAt?: string
     onCommit?: (manifest: Manifest) => void
+    /** Writes a receipt of what each commit read; see `receipts.ts`. */
+    receipts?: CommitReceipts
   }
 ) {
   const writer = randomBytes(16).toString('hex')
@@ -86,7 +90,50 @@ export function openWriter(
         const version = await store.write(MANIFEST_FILE, next, manifest?.version ?? null)
         manifest = { value: next, version }
         options.onCommit?.(next)
+        if (options.receipts) await recordCommit(store, options.receipts, prev, state, closed)
       },
     },
+  })
+}
+
+/** What a writer needs to write the receipt of each commit. */
+export interface CommitReceipts {
+  identity: Identity
+  source: ScanSource
+  /** The first block the source reads: no commit claims a block below it, even its first one. */
+  lowerBound: number
+  scans: ScanLog
+  filters: Filters
+  log: Logger
+}
+
+/**
+ * The receipt of a commit this writer just published: the blocks it moved the lake over, from the
+ * source's lower bound at most, each with the filter it was read with. A commit whose blocks were not
+ * all read gets none, and the blocks it covers stay unproven.
+ */
+async function recordCommit(
+  store: Store,
+  receipts: CommitReceipts,
+  prev: { height: number; hash: string } | undefined,
+  state: { height: number; hash: string },
+  closed: Chunk[]
+): Promise<void> {
+  const from = Math.max(prev ? prev.height + 1 : receipts.lowerBound, receipts.lowerBound)
+  const reads = receipts.scans.take(from, state.height)
+  if (from > state.height) return
+  if (!reads) {
+    receipts.log.warn(`blocks ${from}-${state.height} were committed without a read of each: they get no receipt`)
+    return
+  }
+  const segments = await segmentsOf(receipts.filters, reads)
+  await appendReceipt(store, receipts.identity, {
+    kind: 'commit',
+    source: receipts.source,
+    segments,
+    to: state.height,
+    toHash: state.hash,
+    wrote: closed.map((c) => c.dir),
+    replaced: {},
   })
 }

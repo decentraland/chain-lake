@@ -33,6 +33,8 @@ contract and the topic that holds its address, and `contracts.json` records ever
 <lake>/<dataset>/manifest.json                            the last block the lake holds, and the chunks that hold it
 <lake>/<dataset>/contracts.json                           the contracts followed
 <lake>/<dataset>/coverage.json                            whose history the lake holds, and whether its backfill is complete
+<lake>/<dataset>/scans.json                               a receipt of what each publication read, and with which filter
+<lake>/<dataset>/filter-<sha256>.json                     the addresses a read asked for, named by their digest
 <lake>/<dataset>/chunks/<from>-<to>-<writer>/blocks.parquet
 <lake>/<dataset>/chunks/<from>-<to>-<writer>/logs.parquet
 <lake>/<dataset>/chunks/<from>-<to>-<writer>/transactions.parquet
@@ -43,6 +45,34 @@ read.
 
 Addresses and hashes are lowercase hex strings, so the files read the same in DuckDB, Athena or
 Spark.
+
+### Scan receipts
+
+`scans.json` records what each publication of the lake read, so a reader can tell from which block the
+lake holds every log of an address, without trusting the config or `coverage.json`:
+
+- Every commit a writer wins, and every absorb that wins its manifest, adds a receipt once published:
+  the intervals it read, each with the filter it read them with, the block it ends at with the hash
+  the read observed there, and the chunk folders it added or replaced. A commit that holds no chunk
+  gets one too: its blocks were read and held nothing.
+- A filter is an immutable `filter-<sha256>.json`: the addresses a read asked for. One that only grew
+  names the one before and lists what it added. The follower's filter is the configured contracts,
+  the factories and every contract on file, with the contracts a range created, read again from the
+  range's first block; an absorb's is the contracts it absorbs and those they created.
+- A commit counts for a reader's manifest once that manifest reached its end; an absorb, once every
+  chunk it wrote is listed, or replaced by a later absorb's; an absorb that read no log, once the
+  manifest reached its end. An absorb whose read ended on another hash than the lake holds gets no
+  receipt.
+- An address is held from the first block of the longest run of blocks, ending at the highest
+  receipted block, that the filters asking for it cover without a gap. Blocks a build without receipts
+  committed are such a gap. A backfill claims nothing below the block it starts from.
+- Each receipt belongs to one lake: its dataset, its `chainId` and the `lakeId` its `coverage.json`
+  gets with the first receipt. A lake rebuilt at the same location starts its receipts over. A lake
+  restored from a copy needs the `scans.json` and filters of that same copy, or none.
+
+Each dataset's config names its `chainId`. `live`, `follow` and `absorb` refuse an RPC endpoint that
+serves another chain, and `backfill` refuses a portal whose finalized block differs from the RPC's at
+that height.
 
 ## Commands
 
