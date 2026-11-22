@@ -93,3 +93,27 @@ test('a lake holding RPC headers answers a header it lacks with a retryable erro
   assert.equal((await lake.header(500_000)).hash, '0xforeign')
   assert.equal(fetches, 1)
 })
+
+test('a check that refuses the RPC stops the follow, with the lake as it stands served and nothing written', async (t) => {
+  countFetches(t)
+  const dir = mkdtempSync(join(tmpdir(), 'chain-lake-follow-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A], complete: { height: 20 } }, null)
+  await store.write<Registry>(REGISTRY_FILE, { dataset: DATASET, height: 20, contracts: [{ name: 'A', address: A }] }, null)
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64 })
+  await db.connect()
+  await db.transact({ prevHead: head(-1), nextHead: head(20), isOnTop: true } as never, async (s) => {
+    writeBlocks(s as never, [block(10)])
+    s.setForceFlush(true)
+  })
+  const before = await store.read<Manifest>(MANIFEST_FILE)
+  const served: LiveView[] = []
+  await assert.rejects(
+    follow(dir, store, DATASET, config, (view) => served.push(view), { checkSource: () => Promise.reject(new Error('the RPC serves chain 137')) }),
+    /chain 137/
+  )
+  assert.equal(served.length, 1)
+  assert.equal((await store.read<Manifest>(MANIFEST_FILE))!.version, before!.version)
+  assert.equal(fetches, 0)
+})

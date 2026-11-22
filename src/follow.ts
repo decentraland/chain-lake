@@ -7,7 +7,7 @@ import { openRegistry } from './discover'
 import { RpcClient } from './follow/rpc'
 import { RpcSource } from './follow/source'
 import { Manifest, MANIFEST_FILE } from './manifest'
-import { Filters, identityOf, ScanLog } from './receipts'
+import { Filters, identityOf, renameLake, ScanLog } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { openStore } from './store'
 import { writeBlocks } from './write'
@@ -34,6 +34,8 @@ async function main() {
     const parent = from === 0 ? '0x' : (await new RpcClient(rpcUrl(config.dataset)).call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])).hash
     if (from > 0) await markPartial(store, config, `a development lake started at block ${from} left out the history before it`)
     await store.write<Manifest>(MANIFEST_FILE, { height: from - 1, hash: parent, chunks: [] }, null)
+    // A lake started anew where another was: the receipts of that one prove nothing for this one.
+    await renameLake(store, config)
     logger.info(`starting a new lake at block ${from}`)
   }
 

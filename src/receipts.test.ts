@@ -24,6 +24,7 @@ import {
   Ledger,
   Receipt,
   receiptId,
+  renameLake,
   ScanLog,
   scansFile,
 } from './receipts'
@@ -540,4 +541,44 @@ test('a receipt appended after an entry that is not a receipt, or one altered, i
   const ledger = (await ledgerOf(store))!
   assert.equal(ledger.receipts.length, 5, 'the altered entry did not pass for it')
   assert.equal((await claimsAt(store, identity)).from.get(A), 0)
+})
+
+test('a lake started anew where another was takes nothing from the receipts of the one before', async (t) => {
+  const { dir, store, identity } = await lake(t)
+  // The location starts over from block 30, as a development follow with FROM_BLOCK does.
+  const old = (await store.read<Manifest>(MANIFEST_FILE))!
+  await store.write<Manifest>(MANIFEST_FILE, { height: 29, hash: '0x29', chunks: [] }, old.version)
+  await renameLake(store, config)
+  const renamed = await identityOf(store, config)
+  assert.notEqual(renamed.lakeId, identity.lakeId)
+  const pinned = (await store.read<Manifest>(MANIFEST_FILE))!
+  const scans = ScanLog.reading()
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64, startAt: pinned.version, receipts: { identity: renamed, source: 'rpc', lowerBound: 30, scans, filters: new Filters(store), log: quiet } })
+  await db.connect()
+  scans.add(30, 60, [A])
+  await db.transact(tx(29, 60), async (s) => s.setForceFlush(true))
+  const proven = await claimsAt(store, renamed)
+  assert.deepEqual(proven.finalized, { number: 60, hash: '0x60' })
+  assert.equal(proven.from.get(A), 30, 'never the old lake’s block 0')
+})
+
+test('an absorb that read nothing writes no receipt', async (t) => {
+  const { dir, store, identity } = await lake(t)
+  const before = (await ledgerOf(store))!.receipts.length
+  // X is deployed past the lake's height: there is nothing to read yet.
+  await absorbing(dir, store, identity, gaining({ name: 'X', address: X, fromBlock: 60 }))
+  assert.equal((await ledgerOf(store))!.receipts.length, before)
+})
+
+test('an answer to eth_chainId that is not a chain id is waited out, not taken for a chain', async () => {
+  const answers: unknown[] = [null, '0x1']
+  let calls = 0
+  const client = {
+    async call() {
+      calls++
+      return answers.shift()
+    },
+  } as unknown as RpcClient
+  await checkRpcChain(client, config, quiet)
+  assert.equal(calls, 2)
 })

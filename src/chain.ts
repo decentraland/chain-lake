@@ -1,13 +1,21 @@
 import { DatasetConfig } from './config'
 import { int, NodeBehind, RpcBlock } from './follow/fetch'
-import { RpcClient, untilAnswered } from './follow/rpc'
+import { RpcClient, RpcTrouble, untilAnswered } from './follow/rpc'
 
 type Log = { warn(fields: object, message: string): void }
 
 /** Refuses an RPC endpoint that serves another chain than the dataset's: what it reads would be receipted as the dataset's. */
 export async function checkRpcChain(rpc: RpcClient, config: DatasetConfig, log: Log): Promise<void> {
-  const id = await untilAnswered(`${config.dataset}: reading the chain id`, () => rpc.call<string>('eth_chainId', []), log)
-  const chain = Number(BigInt(id))
+  // An answer that is not a chain id is a node misbehaving: waited out like any RPC trouble.
+  const chain = await untilAnswered(
+    `${config.dataset}: reading the chain id`,
+    async () => {
+      const id = await rpc.call<unknown>('eth_chainId', [])
+      if (typeof id !== 'string' || !/^0x[0-9a-f]+$/i.test(id)) throw new RpcTrouble(`eth_chainId answered ${JSON.stringify(id)}`)
+      return Number(BigInt(id))
+    },
+    log
+  )
   if (chain !== config.chainId) throw new Error(`${config.dataset}: the RPC serves chain ${chain}, and the dataset is chain ${config.chainId}`)
 }
 

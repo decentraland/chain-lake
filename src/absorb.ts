@@ -216,7 +216,8 @@ export async function absorb(options: {
         log.info(`the lake moved while absorbing (attempt ${attempt + 1}); reading the new blocks too`)
         continue
       }
-      if (options.receipts) {
+      // An absorb that read nothing (its contracts start past the lake's height) has nothing to receipt.
+      if (options.receipts && reads.length) {
         // Every read was checked to end on the lake's block before anything was published.
         const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
         const { identity, filters } = options.receipts

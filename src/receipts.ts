@@ -116,6 +116,24 @@ export async function identityOf(store: Store, config: DatasetConfig, attempts =
   throw new Error(`${config.dataset}: ${COVERAGE_FILE} kept changing while naming the lake`)
 }
 
+/**
+ * Gives the lake a new `lakeId`, for a lake started anew at a location that held one: the receipts of the
+ * lake it replaces stay in their own ledger, and prove nothing for this one.
+ */
+export async function renameLake(store: Store, config: DatasetConfig, attempts = 10): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const current = await readCoverage(store)
+    if (!current) return
+    try {
+      await store.write<Coverage>(COVERAGE_FILE, { ...current.value, lakeId: randomBytes(16).toString('hex') }, current.version)
+      return
+    } catch (e) {
+      if (!(e instanceof Conflict)) throw e
+    }
+  }
+  throw new Error(`${config.dataset}: ${COVERAGE_FILE} kept changing while naming the lake anew`)
+}
+
 /** Writes each filter a read used, once, and answers its digest. */
 export class Filters {
   private last?: { digest: string; addresses: Set<string> }

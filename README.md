@@ -64,12 +64,16 @@ block the lake holds every log of an address, without trusting the config or `co
   manifest reached its end. An absorb whose read ends on another hash than the lake holds at that
   height publishes nothing and fails. A receipt whose id is not the digest of what it says proves
   nothing; one that cannot be written is logged, and never stops a writer or an absorb.
+- An absorb's claims rest on the chunks it wrote: if a later absorb rewrites them and its own receipt
+  cannot be written, the earlier absorb's addresses lose their proof (they are under-claimed, never
+  over-claimed) until the lake is receipted again.
 - An address is held from the first block of the longest run of blocks, ending at the highest
   receipted block, that the filters asking for it cover without a gap. Blocks a build without receipts
   committed are such a gap. A backfill claims nothing below the block it starts from.
 - Each receipt belongs to one lake: its dataset, its `chainId` and the `lakeId` its `coverage.json`
   gets with the first receipt, which names its ledger file. A lake rebuilt at the same location gets a
-  new `lakeId`, so a late writer of the lake it replaced never touches the new ledger. A lake restored
+  new `lakeId`, and so does a lake started anew where one was (a backfill or a development follow with
+  no manifest yet), so a late writer of the lake it replaced never touches the new ledger. A lake restored
   from a copy needs the ledger and filters of that same copy, or none.
 
 Each dataset's config names its `chainId`. `live`, `follow` and `absorb` refuse an RPC endpoint that

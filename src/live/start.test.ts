@@ -88,3 +88,22 @@ test('a lake served while it absorbs reads no header from its RPC until this pro
   assert.deepEqual([page.logs.map((l) => l.block_number), page.upper.hash, fetches], [[10], '0xfromrpc', 1])
   assert.deepEqual(states, ['absorbing'], 'the absorb is still running')
 })
+
+test('a check that refuses the RPC makes the start fail', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'chain-lake-start-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A], complete: { height: 20 } }, null)
+  await store.write<Registry>(REGISTRY_FILE, { dataset: DATASET, height: 20, contracts: [{ name: 'A', address: A }] }, null)
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64 })
+  await db.connect()
+  await db.transact({ prevHead: head(-1), nextHead: head(20), isOnTop: true } as never, async (s) => {
+    writeBlocks(s as never, [block(10)])
+    s.setForceFlush(true)
+  })
+  const followed: DatasetConfig = { ...config, contracts: [{ name: 'A', address: A }] }
+  await assert.rejects(
+    start({ lakeDest: dir, store, config: followed, report: () => {}, serve: () => {}, runScript: async () => {}, checkSource: () => Promise.reject(new Error('the RPC serves chain 137')) }),
+    /chain 137/
+  )
+})

@@ -5,9 +5,10 @@ import { checkPortalChain } from './chain'
 import { blockFromEnv, loadConfig, required } from './config'
 import { checkCoverage, markPartial, readCoverage } from './coverage'
 import { followedAddresses, Registry, REGISTRY_FILE } from './discover'
+import { MANIFEST_FILE } from './manifest'
 import { RpcClient } from './follow/rpc'
 import { portalSource } from './portal'
-import { Filters, identityOf, ScanLog } from './receipts'
+import { Filters, identityOf, renameLake, ScanLog } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { openStore } from './store'
 import { writeBlocks } from './write'
@@ -40,6 +41,9 @@ async function main() {
   // What it reads is receipted as this dataset's: a portal serving another chain stops it here.
   const source = new DataSourceBuilder().setPortal(portalSource(config.dataset)).build()
   await checkPortalChain(await source.getFinalizedHead(), new RpcClient(rpcUrl(config.dataset)), config, logger)
+  // A backfill with no manifest yet starts the lake anew: the receipts of whatever lake was here before
+  // prove nothing for it.
+  if (!(await store.read(MANIFEST_FILE))) await renameLake(store, config)
   const identity = await identityOf(store, config)
   const lowerBound = from ?? config.fromBlock
 
