@@ -81,6 +81,15 @@ export async function absorb(options: {
   if (!coverage?.value.complete) throw new Error(`${config.dataset}: only a complete lake takes new contracts`)
   const missing = missingContracts(config, coverage.value)
   if (missing.length === 0) return
+  if (!(await store.read(MANIFEST_FILE)) || !(await store.read(REGISTRY_FILE))) throw new Error(`${config.dataset}: the lake has no manifest or registry`)
+  // The lake this absorb works on, pinned before any history is read, and named (if it is not yet) only
+  // now that it is known complete. Another lake switched in at this location ends the absorb, whatever
+  // its height: nothing read for this one is published to it.
+  const identity: Identity | undefined = options.receipts && (await resolveIdentity(options.receipts.identity))
+  const lakeId = identity?.lakeId ?? coverage.value.lakeId
+  const sameLake = async () => {
+    if ((await readCoverage(store))?.value.lakeId !== lakeId) throw new Error(`${config.dataset}: another lake was switched in while absorbing; nothing more is published`)
+  }
 
   const missingAddresses = new Set(missing.map((c) => c.address))
   const factories = config.factories.filter((f) => missingAddresses.has(f.address))
@@ -185,6 +194,10 @@ export async function absorb(options: {
           throw new Error(`${config.dataset}: the read ended at block ${manifest.value.height} with hash ${end ?? 'unknown'}, and the lake holds ${manifest.value.hash}; nothing was absorbed`)
         }
         fetchedTo = manifest.value.height
+      } else if (reads.length && (manifest.value.height !== fetchedTo || observed.get(fetchedTo)?.toLowerCase() !== manifest.value.hash.toLowerCase())) {
+        // A retry that reads nothing new publishes what was read for the manifest it now publishes to:
+        // only if that read ended on this manifest's block.
+        throw new Error(`${config.dataset}: the lake is at block ${manifest.value.height} (${manifest.value.hash}), not where the read ended; nothing was absorbed`)
       }
 
       // What is still staged: chunks a follower added past the height read first, and the gaps.
@@ -208,8 +221,8 @@ export async function absorb(options: {
         next.push(chunk)
       }
 
-      // The lake the receipt will belong to, named (if it is not yet) only now that it is known complete.
-      const identity: Identity | undefined = options.receipts && (await resolveIdentity(options.receipts.identity))
+      // Nothing is published to a lake switched in while this one was read.
+      await sameLake()
       const known = new Set(registry.value.contracts.map((c) => c.address))
       const children = [...created.values()].sort((x, y) => x.createdAt!.block - y.createdAt!.block || x.createdAt!.logIndex - y.createdAt!.logIndex)
       const added = [...missing, ...children].filter((c) => !known.has(c.address))
@@ -226,8 +239,10 @@ export async function absorb(options: {
         // Every read was checked to end on the lake's block before anything was published.
         const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
         const { filters } = options.receipts
-        // The absorb is published either way: a receipt that cannot be written leaves it unproven.
-        await segmentsOf(filters, reads)
+        // The absorb is published either way: a receipt that cannot be written, or a lake switched in
+        // since, leaves it unproven.
+        await sameLake()
+          .then(() => segmentsOf(filters, reads))
           .then((segments) =>
             appendReceipt(store, identity!, {
               kind: 'absorb',
@@ -241,7 +256,7 @@ export async function absorb(options: {
           )
           .catch((e) => log.error({ err: e }, `${config.dataset}: the absorb got no receipt`))
       }
-      await recordCoverage(store, config, factories, missingAddresses, maxAttempts)
+      await recordCoverage(store, config, factories, missingAddresses, maxAttempts, lakeId)
       log.info(`absorbed ${missing.length} contracts and ${created.size} they created: ${absorbed} blocks into ${replaced.size + written.size} chunks`)
       return
     }
@@ -260,9 +275,11 @@ export async function absorb(options: {
  * Another process may record coverage meanwhile (a second task absorbing the same contracts): the
  * record is then read again and merged, as both hold the same history.
  */
-async function recordCoverage(store: Store, config: DatasetConfig, absorbed: Factory[], addresses: Set<string>, maxAttempts: number): Promise<void> {
+async function recordCoverage(store: Store, config: DatasetConfig, absorbed: Factory[], addresses: Set<string>, maxAttempts: number, lakeId: string | undefined): Promise<void> {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const current = (await readCoverage(store))!
+    // Only the lake the absorb published to: another switched in since does not hold this history.
+    if (current.value.lakeId !== lakeId) throw new Error(`${config.dataset}: another lake was switched in before its coverage was recorded; it is left as it was`)
     const contracts = [...new Set([...current.value.contracts, ...addresses])].sort()
     const factories = { ...factoriesOf(config), ...current.value.factories }
     for (const f of absorbed) factories[f.address] = f.fromBlock

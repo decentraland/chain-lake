@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { cpSync, mkdtempSync, rmSync } from 'fs'
+import { cpSync, mkdtempSync, renameSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { test, TestContext } from 'node:test'
 import { Logger } from '@subsquid/logger'
-import { absorb, absorbDataset, FetchHistory } from './absorb'
+import { absorb, absorbDataset, FetchHistory, missingContracts } from './absorb'
 import { checkPortalChain, checkRpcChain } from './chain'
 import { DatasetConfig, Factory } from './config'
 import { Coverage, COVERAGE_FILE } from './coverage'
@@ -702,4 +702,106 @@ test('an absorb refused on a lake that is not built yet names nothing, and leave
   await assert.rejects(absorbDataset(gaining({ name: 'X', address: X }), dir, store, rpc), /only a complete lake takes new contracts/)
   assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!, before, 'coverage untouched')
   await refuseReplacedLake(store, config)
+})
+
+/** A complete lake of A to block 50 at its own location, whose block 50 has hash `hash`, named and receipted. */
+async function replacementLake(t: TestContext, hash: string) {
+  const dir = tempDir(t)
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A], complete: { height: 50 } }, null)
+  await store.write<Registry>(REGISTRY_FILE, { dataset: DATASET, height: 50, contracts: [{ name: 'A', address: A }] }, null)
+  const identity = await identityOf(store, config)
+  const scans = ScanLog.reading()
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64, receipts: { identity, source: 'rpc', lowerBound: 0, scans, filters: new Filters(store), log: quiet } })
+  await db.connect()
+  scans.add(0, 50, [A])
+  await db.transact({ prevHead: head(-1), nextHead: { height: 50, hash }, isOnTop: true } as never, async (s) => {
+    writeBlocks(s as never, [onlyA(10)])
+    s.setForceFlush(true)
+  })
+  return { dir, identity }
+}
+
+/** Switches the lake at `dir` for the one at `replacement`, the whole dataset directory at once. */
+function switchLakes(dir: string, replacement: string) {
+  renameSync(join(dir, DATASET), join(dir, `${DATASET}.before`))
+  renameSync(join(replacement, DATASET), join(dir, DATASET))
+}
+
+const stateOf = async (store: Store, identity: Identity) => ({
+  coverage: (await store.read<Coverage>(COVERAGE_FILE))!.value,
+  ledger: (await store.read<Ledger>(scansFile(identity.lakeId)))!.value,
+  registry: (await store.read<Registry>(REGISTRY_FILE))!.value,
+  manifest: (await store.read<Manifest>(MANIFEST_FILE))!.value,
+})
+
+test('an absorb whose lake is switched for another at its height while it reads publishes nothing to the other', async (t) => {
+  const { dir, store, identity } = await lake(t)
+  // Another lake, at the same block and hash: only its name tells it apart.
+  const other = await replacementLake(t, '0x50')
+  const base = rpcSeeing()
+  let switched = false
+  const racing: FetchHistory = async (...args) => {
+    if (!switched) {
+      switched = true
+      switchLakes(dir, other.dir)
+    }
+    return base(...args)
+  }
+  const before = await stateOf(openStore(other.dir, DATASET), other.identity)
+  await assert.rejects(absorbing(dir, store, identity, gaining({ name: 'Y', address: Y }), racing), /another lake was switched in/)
+  assert.deepEqual(await stateOf(store, other.identity), before, 'its manifest, registry, coverage and ledger as they were')
+  assert.equal((await claimsAt(store, other.identity)).from.has(Y), false)
+})
+
+test('an absorb whose lake is switched for another just after it published records no coverage in the other', async (t) => {
+  const { dir, store, identity } = await lake(t)
+  const other = await replacementLake(t, '0x50')
+  let switched = false
+  const writes: Store = {
+    read: (name) => store.read(name),
+    version: (name) => store.version(name),
+    async write(name, value, version) {
+      const written = await store.write(name, value, version)
+      if (name === MANIFEST_FILE && !switched) {
+        switched = true
+        switchLakes(dir, other.dir)
+      }
+      return written
+    },
+  }
+  const before = await stateOf(openStore(other.dir, DATASET), other.identity)
+  const withX = gaining({ name: 'X', address: X })
+  await assert.rejects(
+    absorb({ lakeDest: dir, config: withX, store: writes, fetch: rpcSeeing(), maxRange: 100, log: quiet, receipts: { identity, filters: new Filters(store) } }),
+    /another lake was switched in before its coverage was recorded/
+  )
+  const after = await stateOf(store, other.identity)
+  // It published to the lake it read, which was then switched out; the other keeps its coverage and ledger.
+  assert.deepEqual([after.coverage, after.ledger], [before.coverage, before.ledger], 'its coverage and ledger as they were')
+  assert.deepEqual(after.coverage.contracts, [A], 'X is not recorded where its history never went')
+  assert.deepEqual(missingContracts(withX, after.coverage).map((c) => c.address), [X], 'so a later absorb still takes it')
+  assert.deepEqual(after.ledger.receipts.map((r) => r.kind), ['commit'])
+  assert.equal((await claimsAt(store, other.identity)).from.has(X), false)
+})
+
+test('an absorb retried on a copy of its own lake with another block at its height publishes nothing', async (t) => {
+  const { dir, store, identity } = await lake(t)
+  const other = await replacementLake(t, '0xr50')
+  // The copy names itself as this lake, as a restored copy would, but its block 50 is another.
+  const copyStore = openStore(other.dir, DATASET)
+  const coverage = (await copyStore.read<Coverage>(COVERAGE_FILE))!
+  await copyStore.write<Coverage>(COVERAGE_FILE, { ...coverage.value, lakeId: identity.lakeId }, coverage.version)
+  const before = (await copyStore.read<Coverage>(COVERAGE_FILE))!.value
+  const base = rpcSeeing()
+  let switched = false
+  const racing: FetchHistory = async (...args) => {
+    if (!switched) {
+      switched = true
+      switchLakes(dir, other.dir)
+    }
+    return base(...args)
+  }
+  await assert.rejects(absorbing(dir, store, identity, gaining({ name: 'Y', address: Y }), racing), /not where the read ended/)
+  assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!.value, before)
 })
