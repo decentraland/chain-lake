@@ -71,10 +71,12 @@ block the lake holds every log of an address, without trusting the config or `co
   receipted block, that the filters asking for it cover without a gap. Blocks a build without receipts
   committed are such a gap. A backfill claims nothing below the block it starts from.
 - Each receipt belongs to one lake: its dataset, its `chainId` and the `lakeId` its `coverage.json`
-  gets with the first receipt, which names its ledger file. A lake rebuilt at the same location gets a
-  new `lakeId`, and so does a lake started anew where one was (a backfill or a development follow with
-  no manifest yet), so a late writer of the lake it replaced never touches the new ledger. A lake restored
-  from a copy needs the ledger and filters of that same copy, or none.
+  gets with its first receipt, once the lake has a manifest; the `lakeId` names its ledger file. A lake
+  rebuilt from `discover` gets a new one, so a late writer of the lake it replaced never touches the new
+  ledger. A backfill or a development follow refuses to start a lake from nothing where the coverage
+  still names one (its manifest gone): start it in an empty location. A lake restored from a copy needs
+  the ledger and filters of that same copy, or none; take a static `serve` offline while a lake is
+  restored in place, or switch a complete copy in at once.
 
 Each dataset's config names its `chainId`. `live`, `follow` and `absorb` refuse an RPC endpoint that
 serves another chain, and `backfill` refuses a portal whose finalized block differs from the RPC's at

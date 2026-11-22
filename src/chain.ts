@@ -11,7 +11,7 @@ export async function checkRpcChain(rpc: RpcClient, config: DatasetConfig, log: 
     `${config.dataset}: reading the chain id`,
     async () => {
       const id = await rpc.call<unknown>('eth_chainId', [])
-      if (typeof id !== 'string' || !/^0x[0-9a-f]+$/i.test(id)) throw new RpcTrouble(`eth_chainId answered ${JSON.stringify(id)}`)
+      if (typeof id !== 'string' || !/^0x[0-9a-f]+$/i.test(id)) throw new RpcTrouble('eth_chainId returned an invalid quantity')
       return Number(BigInt(id))
     },
     log

@@ -10,7 +10,7 @@ import { Manifest, MANIFEST_FILE } from '../manifest'
 import { Upstream } from '../serve/headers'
 import { LakeDataset } from '../serve/lake'
 import { parseQuery } from '../serve/query'
-import { openStore } from '../store'
+import { openStore, Store } from '../store'
 import { LakeBlock, writeBlocks } from '../write'
 import { openWriter } from '../writer'
 import { follow } from './follow'
@@ -116,4 +116,37 @@ test('a check that refuses the RPC stops the follow, with the lake as it stands 
   assert.equal(served.length, 1)
   assert.equal((await store.read<Manifest>(MANIFEST_FILE))!.version, before!.version)
   assert.equal(fetches, 0)
+})
+
+test('a lake whose naming is slow is served meanwhile, and its RPC headers come back once the RPC is checked', async (t) => {
+  countFetches(t)
+  const dir = mkdtempSync(join(tmpdir(), 'chain-lake-follow-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = openStore(dir, DATASET)
+  // A complete lake from before receipts: following it names it, and that write is held.
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A], complete: { height: 20 } }, null)
+  await store.write<Registry>(REGISTRY_FILE, { dataset: DATASET, height: 20, contracts: [{ name: 'A', address: A }] }, null)
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64 })
+  await db.connect()
+  await db.transact({ prevHead: head(-1), nextHead: head(20), isOnTop: true } as never, async (s) => {
+    writeBlocks(s as never, [block(10)])
+    s.setForceFlush(true)
+  })
+  const held: Store = {
+    read: (name) => store.read(name),
+    version: (name) => store.version(name),
+    write: (name, value, version) => (name === COVERAGE_FILE ? new Promise(() => {}) : store.write(name, value, version)),
+  }
+  let served: (view: LiveView) => void = () => {}
+  const view = new Promise<LiveView>((resolve) => (served = resolve))
+  let followed = false
+  void follow(dir, held, DATASET, config, served, { checkSource: async () => {} }).then(() => (followed = true))
+  const durable = await view
+  const query = parseQuery({ type: 'evm', fromBlock: 0, fields: { log: { address: true } }, logs: [{ address: [A] }] })
+  assert.deepEqual((await durable.page(query, 0, 10)).logs.map((l) => l.block_number), [10])
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  // The check passed: the header the files lack comes from the RPC, though the lake is not named yet.
+  assert.equal((await durable.page(query, 0, 20)).upper.hash, '0xforeign')
+  assert.equal(fetches, 1)
+  assert.equal(followed, false, 'no writer before the lake is named')
 })

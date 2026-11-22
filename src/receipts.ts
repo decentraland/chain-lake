@@ -117,21 +117,29 @@ export async function identityOf(store: Store, config: DatasetConfig, attempts =
 }
 
 /**
- * Gives the lake a new `lakeId`, for a lake started anew at a location that held one: the receipts of the
- * lake it replaces stay in their own ledger, and prove nothing for this one.
+ * Refuses to start a lake from nothing where one stood. A `lakeId` is given only once a lake has a
+ * manifest, by the first receipt written for it; a location whose manifest is gone but whose coverage
+ * still names a lake held that lake, and starting another there would let its receipts speak for the new
+ * one. Start it in an empty location, or take the old lake's coverage record away first.
  */
-export async function renameLake(store: Store, config: DatasetConfig, attempts = 10): Promise<void> {
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const current = await readCoverage(store)
-    if (!current) return
-    try {
-      await store.write<Coverage>(COVERAGE_FILE, { ...current.value, lakeId: randomBytes(16).toString('hex') }, current.version)
-      return
-    } catch (e) {
-      if (!(e instanceof Conflict)) throw e
-    }
+export async function refuseReplacedLake(store: Store, config: DatasetConfig): Promise<void> {
+  const lakeId = (await readCoverage(store))?.value.lakeId
+  if (lakeId) throw new Error(`${config.dataset}: the location held lake ${lakeId}, whose manifest is gone; start the new lake in an empty location`)
+}
+
+/**
+ * The lake's identity for its receipts, asked for only when the first receipt is written, once the lake
+ * has a manifest; a failed attempt is tried again by the next receipt.
+ */
+export function lazyIdentity(store: Store, config: DatasetConfig): () => Promise<Identity> {
+  let known: Promise<Identity> | undefined
+  return () => {
+    known ??= identityOf(store, config).catch((e) => {
+      known = undefined
+      throw e
+    })
+    return known
   }
-  throw new Error(`${config.dataset}: ${COVERAGE_FILE} kept changing while naming the lake anew`)
 }
 
 /** Writes each filter a read used, once, and answers its digest. */

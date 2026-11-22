@@ -46,14 +46,16 @@ export async function follow(
   const lake = await LakeDataset.open(lakeDest, dataset)
   // A lake the portal cannot read would otherwise be served as a 503 on every request.
   await lake.check()
-  const identity = await identityOf(store, config)
   // Until the RPC is checked, the view serves only what the lake's files hold: a header they lack is a
   // retryable 503, not a header from what may be another chain.
   lake.holdRpcHeaders()
   serve(new LiveView(lake, new Tail({ height: pinned.value.height, hash: pinned.value.hash })))
-  // What it reads is receipted as this dataset's: an RPC serving another chain stops it here.
-  await (options.checkSource ?? (() => checkRpcChain(rpc, config, log)))()
-  lake.allowRpcHeaders()
+  // The check alone releases the headers; naming the lake for its receipts runs beside it, and both
+  // come before the writer. An RPC serving another chain stops it here.
+  const checked = (options.checkSource ?? (() => checkRpcChain(rpc, config, log)))().then(() => lake.allowRpcHeaders())
+  checked.catch(() => {})
+  const identity = await identityOf(store, config)
+  await checked
 
   const scans = ScanLog.reading()
   const source = new RpcSource(rpc, config, registry, save, {

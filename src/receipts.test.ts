@@ -23,8 +23,9 @@ import {
   identityOf,
   Ledger,
   Receipt,
+  lazyIdentity,
   receiptId,
-  renameLake,
+  refuseReplacedLake,
   ScanLog,
   scansFile,
 } from './receipts'
@@ -543,23 +544,75 @@ test('a receipt appended after an entry that is not a receipt, or one altered, i
   assert.equal((await claimsAt(store, identity)).from.get(A), 0)
 })
 
-test('a lake started anew where another was takes nothing from the receipts of the one before', async (t) => {
-  const { dir, store, identity } = await lake(t)
-  // The location starts over from block 30, as a development follow with FROM_BLOCK does.
-  const old = (await store.read<Manifest>(MANIFEST_FILE))!
-  await store.write<Manifest>(MANIFEST_FILE, { height: 29, hash: '0x29', chunks: [] }, old.version)
-  await renameLake(store, config)
-  const renamed = await identityOf(store, config)
-  assert.notEqual(renamed.lakeId, identity.lakeId)
-  const pinned = (await store.read<Manifest>(MANIFEST_FILE))!
+test('a lake is never started from nothing where another one stood', async (t) => {
+  const { dir, store } = await lake(t)
+  // The manifest is gone, but the coverage still names the lake that was here.
+  rmSync(join(dir, DATASET, MANIFEST_FILE))
+  await assert.rejects(refuseReplacedLake(store, config), /start the new lake in an empty location/)
+  // A location discover just started names no lake yet.
+  const fresh = openStore(tempDir(t), DATASET)
+  await fresh.write<Coverage>(COVERAGE_FILE, { contracts: [A] }, null)
+  await refuseReplacedLake(fresh, config)
+})
+
+test('a lake is named by its first receipt; one stopped before that leaves only a gap', async (t) => {
+  const dir = tempDir(t)
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A] }, null)
+  // The first attempt to name the lake fails, as a process stopped there would.
+  let refuse = true
+  const flaky: Store = {
+    read: (name) => store.read(name),
+    version: (name) => store.version(name),
+    async write(name, value, version) {
+      if (name === COVERAGE_FILE && refuse) {
+        refuse = false
+        throw new Error('stopped')
+      }
+      return store.write(name, value, version)
+    },
+  }
   const scans = ScanLog.reading()
-  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64, startAt: pinned.version, receipts: { identity: renamed, source: 'rpc', lowerBound: 30, scans, filters: new Filters(store), log: quiet } })
+  const db = openWriter(dir, DATASET, store, {
+    chunkSizeMb: 64,
+    receipts: { identity: lazyIdentity(flaky, config), source: 'rpc', lowerBound: 0, scans, filters: new Filters(store), log: quiet },
+  })
   await db.connect()
-  scans.add(30, 60, [A])
-  await db.transact(tx(29, 60), async (s) => s.setForceFlush(true))
-  const proven = await claimsAt(store, renamed)
-  assert.deepEqual(proven.finalized, { number: 60, hash: '0x60' })
-  assert.equal(proven.from.get(A), 30, 'never the old lake’s block 0')
+  scans.add(0, 20, [A])
+  await db.transact(tx(-1, 20), async (s) => s.setForceFlush(true))
+  assert.equal((await store.read<Coverage>(COVERAGE_FILE))!.value.lakeId, undefined, 'not named, and no receipt')
+  scans.add(21, 40, [A])
+  await db.transact(tx(20, 40), async (s) => s.setForceFlush(true))
+  const identity = await identityOf(store, config)
+  const proven = await claimsAt(store, identity)
+  assert.deepEqual(proven.finalized, { number: 40, hash: '0x40' })
+  assert.equal(proven.from.get(A), 21, 'the unreceipted first commit is a gap, never a claim')
+})
+
+test('of two processes starting one lake, only the one that publishes it names it', async (t) => {
+  const dir = tempDir(t)
+  const store = openStore(dir, DATASET)
+  await store.write<Coverage>(COVERAGE_FILE, { contracts: [A] }, null)
+  const starter = () => {
+    const scans = ScanLog.reading()
+    const db = openWriter(dir, DATASET, openStore(dir, DATASET), {
+      chunkSizeMb: 64,
+      receipts: { identity: lazyIdentity(openStore(dir, DATASET), config), source: 'rpc', lowerBound: 0, scans, filters: new Filters(store), log: quiet },
+    })
+    return { db, scans }
+  }
+  const [a, b] = [starter(), starter()]
+  await a.db.connect()
+  await b.db.connect()
+  a.scans.add(0, 20, [A])
+  await a.db.transact(tx(-1, 20), async (s) => s.setForceFlush(true))
+  b.scans.add(0, 30, [A])
+  await assert.rejects(b.db.transact(tx(-1, 30), async (s) => s.setForceFlush(true)))
+  const coverage = (await store.read<Coverage>(COVERAGE_FILE))!.value
+  const identity = await identityOf(store, config)
+  assert.equal(identity.lakeId, coverage.lakeId)
+  assert.deepEqual((await ledgerOf(store))!.receipts.map((r) => r.to), [20], 'the one that lost wrote nothing')
+  assert.equal((await claimsAt(store, identity)).from.get(A), 0)
 })
 
 test('an absorb that read nothing writes no receipt', async (t) => {

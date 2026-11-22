@@ -101,7 +101,8 @@ export function openWriter(
 
 /** What a writer needs to write the receipt of each commit. */
 export interface CommitReceipts {
-  identity: Identity
+  /** The lake's identity, or how to get it once the lake has a manifest (see `lazyIdentity`). */
+  identity: Identity | (() => Promise<Identity>)
   source: ScanSource
   /** The first block the source reads: no commit claims a block below it, even its first one. */
   lowerBound: number
@@ -130,7 +131,8 @@ async function recordCommit(
     return
   }
   const segments = await segmentsOf(receipts.filters, reads)
-  await appendReceipt(store, receipts.identity, {
+  const identity = typeof receipts.identity === 'function' ? await receipts.identity() : receipts.identity
+  await appendReceipt(store, identity, {
     kind: 'commit',
     source: receipts.source,
     segments,
