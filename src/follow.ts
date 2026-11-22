@@ -24,6 +24,9 @@ async function main() {
   const lakeDest = required('LAKE_DEST')
   const store = openStore(lakeDest, config.dataset)
   const stop = blockFromEnv('STOP_BLOCK')
+  // Checked before anything is read from it, the parent of a new development lake included.
+  const rpc = new RpcClient(rpcUrl(config.dataset))
+  await checkRpcChain(rpc, config, logger)
 
   // The follower continues a lake; on an empty one it would start from block 0 over RPC. It needs
   // the backfill's manifest, or an explicit FROM_BLOCK to start a development lake.
@@ -32,7 +35,7 @@ async function main() {
     if (from === undefined) throw new Error(`${config.dataset} has no lake to continue: run the backfill first, or set FROM_BLOCK`)
     await refuseReplacedLake(store, config)
     // Block 0 has no parent: the lake starts empty, as file-store's own initial state does.
-    const parent = from === 0 ? '0x' : (await new RpcClient(rpcUrl(config.dataset)).call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])).hash
+    const parent = from === 0 ? '0x' : (await rpc.call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])).hash
     if (from > 0) await markPartial(store, config, `a development lake started at block ${from} left out the history before it`)
     await store.write<Manifest>(MANIFEST_FILE, { height: from - 1, hash: parent, chunks: [] }, null)
     logger.info(`starting a new lake at block ${from}`)
@@ -41,8 +44,6 @@ async function main() {
   // The lake's state first, then the registry, as in live: the writer starts from exactly that state.
   const pinned = (await store.read<Manifest>(MANIFEST_FILE))!
   const { registry, save } = await openRegistry(store)
-  const rpc = new RpcClient(rpcUrl(config.dataset))
-  await checkRpcChain(rpc, config, logger)
   // A lake no coverage record names (a development lake from block 0) gets no receipts. The others are
   // named by their first receipt, once their manifest exists.
   const identity = (await readCoverage(store)) ? lazyIdentity(store, config) : undefined

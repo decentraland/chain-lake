@@ -39,7 +39,7 @@ function countFetches(t: { after(f: () => void): void }) {
   t.after(() => (globalThis.fetch = realFetch))
 }
 
-test('the history a lake holds is served while its RPC is being checked, and nothing is written until it is', async (t) => {
+test('the history a lake holds is served while its RPC is being checked, and no block is written until it is', async (t) => {
   countFetches(t)
   const dir = mkdtempSync(join(tmpdir(), 'chain-lake-follow-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))

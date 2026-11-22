@@ -5,6 +5,7 @@ import { join } from 'path'
 import { test, TestContext } from 'node:test'
 import { Logger } from '@subsquid/logger'
 import { absorb, absorbDataset, FetchHistory, missingContracts } from './absorb'
+import { backfillDataset, checkBackfill } from './backfill'
 import { checkPortalChain, checkRpcChain } from './chain'
 import { DatasetConfig, Factory } from './config'
 import { Coverage, COVERAGE_FILE } from './coverage'
@@ -804,4 +805,25 @@ test('an absorb retried on a copy of its own lake with another block at its heig
   }
   await assert.rejects(absorbing(dir, store, identity, gaining({ name: 'Y', address: Y }), racing), /not where the read ended/)
   assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!.value, before)
+})
+
+test('a backfill is refused before it reads when its portal serves another chain, or another lake stood where it would start', async (t) => {
+  const rpc = { call: async (method: string) => (method === 'eth_chainId' ? '0x1' : { number: '0x5', hash: '0xa', parentHash: '0x4', timestamp: '0x1' }) } as unknown as RpcClient
+  const fresh = openStore(tempDir(t), DATASET)
+  await fresh.write<Coverage>(COVERAGE_FILE, { contracts: [A] }, null)
+  await checkBackfill(fresh, config, { number: 5, hash: '0xa' }, rpc)
+  await assert.rejects(checkBackfill(fresh, config, { number: 5, hash: '0xb' }, rpc), /different chains/)
+  const { dir, store } = await lake(t)
+  rmSync(join(dir, DATASET, MANIFEST_FILE))
+  await assert.rejects(checkBackfill(store, config, { number: 5, hash: '0xa' }, rpc), /start the new lake in an empty location/)
+})
+
+test('a backfill refused before it reads leaves a complete lake’s coverage as it was, a development run included', async (t) => {
+  const { dir, store, identity } = await lake(t)
+  const rpc = { call: async (method: string) => (method === 'eth_chainId' ? '0x1' : { number: '0x5', hash: '0xa', parentHash: '0x4', timestamp: '0x1' }) } as unknown as RpcClient
+  const before = (await store.read<Coverage>(COVERAGE_FILE))!.value
+  await assert.rejects(backfillDataset(config, dir, store, { fromBlock: 1, portalHead: async () => ({ number: 5, hash: '0xb' }), rpc }), /different chains/)
+  const after = (await store.read<Coverage>(COVERAGE_FILE))!.value
+  assert.deepEqual(after, before, 'not marked partial')
+  assert.equal((await claimsAt(store, identity)).from.get(A), 0, 'and still proven')
 })

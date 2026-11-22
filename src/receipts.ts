@@ -380,7 +380,8 @@ export async function claims(
     if (objects.has(digest)) return objects.get(digest)!
     objects.set(digest, null)
     const object = await loadFilter(digest).catch(() => undefined)
-    if (!object || !Array.isArray(object.add) || digestOf(object) !== digest) return null
+    if (!object || !Array.isArray(object.add) || !object.add.every((a) => typeof a === 'string')) return null
+    if ((object.parent !== undefined && typeof object.parent !== 'string') || digestOf(object) !== digest) return null
     if (object.parent !== undefined && !(await load(object.parent))) return null
     objects.set(digest, object)
     return object

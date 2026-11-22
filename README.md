@@ -63,15 +63,19 @@ block the lake holds every log of an address, without trusting the config or `co
   chunk it wrote is listed, or replaced by a later absorb's; an absorb that read no log, once the
   manifest reached its end. An absorb whose read ends on another hash than the lake holds at that
   height publishes nothing and fails. A receipt whose id is not the digest of what it says proves
-  nothing; one that cannot be written is logged, and never stops a writer or an absorb.
+  nothing; one that cannot be written is logged, and never stops a writer or an absorb. A missed receipt
+  is never retried: for each address, any interval without another receipt covering it limits how far
+  back its coverage extends.
 - An absorb's claims rest on the chunks it wrote: if a later absorb rewrites them and its own receipt
   cannot be written, the earlier absorb's addresses lose their proof (they are under-claimed, never
   over-claimed) until the lake is receipted again.
 - An address is held from the first block of the longest run of blocks, ending at the highest
   receipted block, that the filters asking for it cover without a gap. Blocks a build without receipts
   committed are such a gap. A backfill claims nothing below the block it starts from.
-- Each receipt belongs to one lake: its dataset, its `chainId` and the `lakeId` its `coverage.json`
-  gets with its first receipt, once the lake has a manifest; the `lakeId` names its ledger file. A lake
+- Each receipt belongs to one lake: its dataset, its `chainId` and its `lakeId`, which names its ledger
+  file. A lake gets its `lakeId` once it has a manifest: when `live` or `absorb` starts on a lake without
+  one, or with the first receipt of a lake a backfill or a development follow started. Naming the lake
+  at start is part of starting: a storage failure there ends the process, as any storage failure does. A lake
   rebuilt from `discover` gets a new one, so a late writer of the lake it replaced never touches the new
   ledger. A backfill or a development follow refuses to start a lake from nothing where the coverage
   still names one (its manifest gone): start it in an empty location. A lake restored from a copy needs

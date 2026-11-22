@@ -81,7 +81,7 @@ export async function absorb(options: {
   if (!coverage?.value.complete) throw new Error(`${config.dataset}: only a complete lake takes new contracts`)
   const missing = missingContracts(config, coverage.value)
   if (missing.length === 0) return
-  if (!(await store.read(MANIFEST_FILE)) || !(await store.read(REGISTRY_FILE))) throw new Error(`${config.dataset}: the lake has no manifest or registry`)
+  if ((await store.version(MANIFEST_FILE)) === undefined || (await store.version(REGISTRY_FILE)) === undefined) throw new Error(`${config.dataset}: the lake has no manifest or registry`)
   // The lake this absorb works on, pinned before any history is read, and named (if it is not yet) only
   // now that it is known complete. It is checked again before each publication and before coverage is
   // recorded, which catches some lakes switched in under a running absorb; switching a lake under any
