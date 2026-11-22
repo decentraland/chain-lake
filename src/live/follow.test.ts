@@ -7,6 +7,8 @@ import { DatasetConfig } from '../config'
 import { Coverage, COVERAGE_FILE } from '../coverage'
 import { Registry, REGISTRY_FILE } from '../discover'
 import { Manifest, MANIFEST_FILE } from '../manifest'
+import { Upstream } from '../serve/headers'
+import { LakeDataset } from '../serve/lake'
 import { parseQuery } from '../serve/query'
 import { openStore } from '../store'
 import { LakeBlock, writeBlocks } from '../write'
@@ -25,7 +27,20 @@ const block = (number: number): LakeBlock => ({
 })
 const head = (n: number) => ({ height: n, hash: n < 0 ? '0x' : `0x${n}` })
 
+/** Counts every outbound request, answering each with a block of another chain. */
+let fetches = 0
+const realFetch = globalThis.fetch
+function countFetches(t: { after(f: () => void): void }) {
+  fetches = 0
+  globalThis.fetch = (async () => {
+    fetches++
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { number: '0x7a120', hash: '0xforeign', parentHash: '0x0', timestamp: '0x1' } }))
+  }) as typeof fetch
+  t.after(() => (globalThis.fetch = realFetch))
+}
+
 test('the history a lake holds is served while its RPC is being checked, and nothing is written until it is', async (t) => {
+  countFetches(t)
   const dir = mkdtempSync(join(tmpdir(), 'chain-lake-follow-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = openStore(dir, DATASET)
@@ -48,8 +63,33 @@ test('the history a lake holds is served while its RPC is being checked, and not
   const durable = await view
   assert.deepEqual(await durable.head(), { number: 20, hash: '0x20' })
   const query = parseQuery({ type: 'evm', fromBlock: 0, fields: { log: { address: true } }, logs: [{ address: [A] }] })
-  assert.deepEqual((await durable.page(query, 0, 20)).logs.map((l) => l.block_number), [10])
+  const page = await durable.page(query, 0, 10)
+  assert.deepEqual([page.logs.map((l) => l.block_number), page.upper.hash], [[10], '0x10'])
+  // The header of block 20 is not in the files: a retryable error, never a header from the unchecked RPC.
+  await assert.rejects(durable.page(query, 0, 20), Upstream)
+  assert.equal(fetches, 0, 'no request left for the RPC')
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.equal(followed, false, 'the follower waits for the check')
   assert.equal((await store.read<Manifest>(MANIFEST_FILE))!.version, before!.version, 'and nothing advanced the lake')
+})
+
+test('a lake holding RPC headers answers a header it lacks with a retryable error, and reads it from the RPC once allowed', async (t) => {
+  countFetches(t)
+  const dir = mkdtempSync(join(tmpdir(), 'chain-lake-follow-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = openStore(dir, DATASET)
+  const db = openWriter(dir, DATASET, store, { chunkSizeMb: 64 })
+  await db.connect()
+  await db.transact({ prevHead: head(-1), nextHead: head(20), isOnTop: true } as never, async (s) => {
+    writeBlocks(s as never, [block(10)])
+    s.setForceFlush(true)
+  })
+  const lake = await LakeDataset.open(dir, DATASET)
+  lake.holdRpcHeaders()
+  assert.equal((await lake.header(10)).hash, '0x10')
+  await assert.rejects(lake.header(500_000), Upstream)
+  assert.equal(fetches, 0)
+  lake.allowRpcHeaders()
+  assert.equal((await lake.header(500_000)).hash, '0xforeign')
+  assert.equal(fetches, 1)
 })

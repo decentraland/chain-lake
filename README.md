@@ -75,7 +75,8 @@ block the lake holds every log of an address, without trusting the config or `co
 Each dataset's config names its `chainId`. `live`, `follow` and `absorb` refuse an RPC endpoint that
 serves another chain, and `backfill` refuses a portal whose finalized block differs from the RPC's at
 that height. `live` serves a complete lake as it stands while it checks the RPC, so an RPC outage at
-start holds back only new blocks.
+start holds back only new blocks; until the check passes, a header the lake's files lack is a 503
+rather than one read from that RPC.
 
 ## Commands
 

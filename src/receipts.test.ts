@@ -526,3 +526,18 @@ test('a ledger this build cannot write leaves the commit published, without a re
   assert.equal((await store.read<{ schemaVersion: number }>(scansFile(identity.lakeId)))!.value.schemaVersion, 2, 'left as it was')
   assert.deepEqual(errors, ['blocks to 20 got no receipt'])
 })
+
+test('a receipt appended after an entry that is not a receipt, or one altered, is kept and proves what it says', async (t) => {
+  const { store, identity } = await lake(t)
+  const file = scansFile(identity.lakeId)
+  const current = (await store.read<Ledger>(file))!
+  const [first, second, third] = current.value.receipts
+  // Junk, and the last commit altered under its own id: neither is the receipt appended below.
+  const junk = [first, second, null, { ...third, segments: [{ ...third.segments[0], to: 49 }] }]
+  await store.write(file, { ...current.value, receipts: junk }, current.version)
+  const { id: _, ...last } = third
+  await appendReceipt(store, identity, last as Receipt)
+  const ledger = (await ledgerOf(store))!
+  assert.equal(ledger.receipts.length, 5, 'the altered entry did not pass for it')
+  assert.equal((await claimsAt(store, identity)).from.get(A), 0)
+})

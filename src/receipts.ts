@@ -232,8 +232,14 @@ export async function appendReceipt(store: Store, identity: Identity, receipt: R
     if (current && !sameLake(current.value, identity)) {
       throw new Error(`${identity.dataset}: ${file} belongs to ${current.value.dataset} on chain ${current.value.chainId}, not to chain ${identity.chainId}`)
     }
+    if (current && !Array.isArray(current.value.receipts)) throw new Error(`${identity.dataset}: ${file} holds no list of receipts`)
     const base: Ledger = current?.value ?? { schemaVersion: SCANS_SCHEMA, ...identity, receipts: [] }
-    if (base.receipts.some((r) => r.id === id)) return
+    // Only an entry that verifies under this id is this receipt; one that does not parse is passed over.
+    const present = base.receipts.some((raw) => {
+      const parsed = parseReceipt(raw)
+      return parsed !== undefined && isRecord(raw) && raw.id === id && receiptId(identity, parsed) === id
+    })
+    if (present) return
     try {
       await store.write<Ledger>(file, { ...base, receipts: [...base.receipts, { id, ...receipt }] }, current?.version ?? null)
       return

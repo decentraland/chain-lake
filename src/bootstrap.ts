@@ -60,13 +60,15 @@ export async function bootstrap(
 
 /**
  * Records the backfill complete on the coverage as it stands now: the backfill wrote it meanwhile (it
- * names the lake for its receipts, or marks a development run partial), and what it wrote stays.
+ * names the lake for its receipts), and what it wrote stays. A lake it marked partial is refused, with
+ * its marker kept and `complete` left unset.
  */
 async function recordComplete(store: Store, config: DatasetConfig, height: number, attempts = 5): Promise<void> {
   for (let attempt = 0; attempt < attempts; attempt++) {
     const current = await readCoverage(store)
     if (!current) throw new Error(`${config.dataset}: the coverage record disappeared during the backfill`)
-    if (!current.value.partial) checkCoverage(config, current.value)
+    // A lake the backfill marked partial meanwhile is refused, as any start would refuse it.
+    checkCoverage(config, current.value)
     try {
       await store.write<Coverage>(COVERAGE_FILE, { ...current.value, complete: { height } }, current.version)
       return
