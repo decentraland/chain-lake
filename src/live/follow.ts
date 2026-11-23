@@ -9,6 +9,7 @@ import { RpcSource } from '../follow/source'
 import { Manifest, MANIFEST_FILE } from '../manifest'
 import { Filters, identityOf, ScanLog } from '../receipts'
 import { rpcUrl } from '../serve/headers'
+import { CoverageProvider } from '../serve/contracts'
 import { LakeDataset } from '../serve/lake'
 import { Store } from '../store'
 import { writeBlocks } from '../write'
@@ -118,5 +119,6 @@ export async function follow(
     () => log.info(`head ${hot?.head().number ?? '-'} (${hot?.size ?? 0} hot), finalized ${tail.processed.height}, written ${tail.lake.height}, ${tail.size} finalized blocks in memory`),
     60_000
   ).unref()
-  return new LiveView(lake, tail, hot)
+  // Coverage is stated only by the followed view, and only up to the block it serves from the files.
+  return new LiveView(lake, tail, hot, new CoverageProvider(store, identity, { live: lake, files: () => tail.lake }))
 }

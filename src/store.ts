@@ -12,6 +12,17 @@ export interface Versioned<T> {
 /** The file changed since this process read it: another process writes the dataset, and this one must stop. */
 export class Conflict extends Error {}
 
+/** A file read whole that is not JSON: reading it again would not change it. */
+export class NotJson extends Error {}
+
+function parse<T>(name: string, text: string): T {
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    throw new NotJson(`${name} is not JSON`)
+  }
+}
+
 /**
  * The few files that say what a dataset's lake holds: its manifest, its registry of contracts and its
  * backfill's coverage. Every write is a compare-and-swap against the version this process last read or
@@ -51,7 +62,7 @@ class S3Store implements Store {
   async read<T>(name: string): Promise<Versioned<T> | undefined> {
     try {
       const res = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: this.key(name) }))
-      return { value: JSON.parse(await res.Body!.transformToString()) as T, version: res.ETag! }
+      return { value: parse<T>(name, await res.Body!.transformToString()), version: res.ETag! }
     } catch (e) {
       if ((e as { name?: string }).name === 'NoSuchKey') return undefined
       throw e
@@ -110,7 +121,7 @@ class LocalStore implements Store {
       if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw e
     }
-    return { value: JSON.parse(text) as T, version: digest(text) }
+    return { value: parse<T>(name, text), version: digest(text) }
   }
 
   async version(name: string): Promise<string | undefined> {

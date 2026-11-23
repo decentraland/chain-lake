@@ -1,7 +1,8 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http'
 import { createLogger } from '@subsquid/logger'
+import type { ContractsAnswer } from './contracts'
 import { BlockHeader } from './headers'
-import { LogRow, Page, TransactionRow } from './lake'
+import { LogRow, Page, Receded, TransactionRow } from './lake'
 import { BadQuery, EvmQuery, parseQuery } from './query'
 
 const logger = createLogger('lake:portal')
@@ -15,10 +16,15 @@ export interface BlockRef {
 export interface ChainView {
   /** The highest finalized block this view can serve. */
   head(): Promise<BlockRef>
-  /** What the query asks for in [from, to], `to` at most the head; it may end before `to`. */
+  /**
+   * What the query asks for in [from, to], `to` at most the head; it may end before `to`. Throws
+   * `Receded` when the view no longer holds `from`: a lake restored from an older copy since the head was read.
+   */
   page(query: EvmQuery, from: number, to: number): Promise<Page>
   /** Blocks above the finalized head, for `stream`; absent when only finalized blocks are served. */
   hot?: HotView
+  /** From which block the lake holds every log of each address; a view without it answers 503. */
+  contracts?: () => Promise<ContractsAnswer>
 }
 
 export interface HotView {
@@ -93,12 +99,17 @@ export function createPortal(view: Views, health?: () => Health, options: Portal
 }
 
 async function answer(view: Views, req: IncomingMessage, res: ServerResponse, wait: { ms: number; pollMs: number }) {
-  const match = req.url?.match(/^\/datasets\/([^/]+)\/(stream|finalized-stream|head|finalized-head)\/?$/)
+  const match = req.url?.match(/^\/datasets\/([^/]+)\/(stream|finalized-stream|head|finalized-head|contracts)\/?$/)
   if (!match) return send(res, 404, { error: 'not found' })
   const [, name, endpoint] = match
   const chain = /^[a-z0-9-]+$/.test(name) ? await view(name) : undefined
   if (!chain) return send(res, 404, { error: `unknown dataset ${name}` })
 
+  if (endpoint === 'contracts') {
+    if (req.method !== 'GET') return send(res, 405, { error: 'use GET' })
+    if (!chain.contracts) throw new NotReady(`${name}: its coverage is not stated yet`)
+    return send(res, 200, await chain.contracts())
+  }
   if (endpoint === 'head' || endpoint === 'finalized-head') {
     if (req.method !== 'GET') return send(res, 405, { error: 'use GET' })
     const finalized = await chain.head()
@@ -164,14 +175,31 @@ async function answer(view: Views, req: IncomingMessage, res: ServerResponse, wa
     // were dropped instead (a reorg the next poll rebuilds), there may be nothing to serve yet.
     finalized = await chain.head()
     const end = Math.min(to, finalized.number)
-    if (query.fromBlock > end) {
+    if (query.fromBlock <= end) {
+      try {
+        page = await chain.page(query, query.fromBlock, end)
+        // A view that can go back names the head its page was read at: the one read before may be past
+        // it, and a client keeps the highest finalized head it was told.
+        if (page.head) {
+          finalized = page.head
+          latest = latestOf(chain, finalized)
+        }
+      } catch (e) {
+        if (!(e instanceof Receded)) throw e
+        // The view went back below the block asked for meanwhile (an older copy of its lake restored):
+        // the 204 names the head the page's read found.
+        finalized = e.head
+      }
+    }
+    if (!page) {
       res.writeHead(204, headHeaders(finalized, latestOf(chain, finalized)))
       return res.end()
     }
-    page = await chain.page(query, query.fromBlock, end)
   }
   if (await forked()) return answerFork()
-  res.writeHead(200, { 'content-type': 'application/x-ndjson', ...headHeaders(finalized, latest) })
+  // A page read from the lake's files names the manifest it was read from, as a coverage answer does.
+  const revision: Record<string, string> = page.revision ? { 'x-lake-coverage-revision': page.revision } : {}
+  res.writeHead(200, { 'content-type': 'application/x-ndjson', ...headHeaders(finalized, latest), ...revision })
   for (const line of blockLines(query, page.upper, page.headers, page.logs, page.transactions)) res.write(line + '\n')
   res.end()
 }

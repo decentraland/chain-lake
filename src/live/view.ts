@@ -1,6 +1,7 @@
 import { headerFromRpc } from '../serve/headers'
 import { LakeDataset, Page } from '../serve/lake'
 import { EvmQuery } from '../serve/query'
+import { ContractsAnswer, CoverageProvider } from '../serve/contracts'
 import { ChainView, HotView } from '../serve/server'
 import { HotChain } from './hot'
 import { pageOf, Tail } from './tail'
@@ -15,8 +16,10 @@ const FORK_CHECK_DEPTH = 5000
  */
 export class LiveView implements ChainView {
   readonly hot?: HotView
+  readonly contracts?: () => Promise<ContractsAnswer>
 
-  constructor(private readonly lake: LakeDataset, private readonly tail: Tail, chain?: HotChain) {
+  constructor(private readonly lake: LakeDataset, private readonly tail: Tail, chain?: HotChain, coverage?: CoverageProvider) {
+    if (coverage) this.contracts = () => coverage.contracts()
     if (chain) {
       /**
        * The hash this view holds for a block, without asking the node. Above the finalized head the
