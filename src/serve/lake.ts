@@ -2,7 +2,7 @@ import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
 import { createLogger } from '@subsquid/logger'
 import { Chunk, Manifest, MANIFEST_FILE } from '../manifest'
 import { openStore, Store } from '../store'
-import { BlockHeader, headerFromRpc } from './headers'
+import { BlockHeader, headerFromRpc, Upstream } from './headers'
 import { EvmQuery, logCondition } from './query'
 
 /** Logs per response; a response stops at a block boundary once it has this many. */
@@ -228,7 +228,23 @@ export class LakeDataset {
         )
       : []
     if (row) return { number: num(row.number), hash: row.hash as string, parentHash: row.parent_hash as string, timestamp: num(row.timestamp) }
+    if (!this.rpcHeaders) throw new Upstream(`block ${number} of ${this.dataset} is not in the lake, and its RPC is not checked yet`)
     return headerFromRpc(this.dataset, number)
+  }
+
+  /** Whether a header the lake lacks may be read from the dataset's RPC. */
+  private rpcHeaders = true
+
+  /**
+   * Answers a header the lake lacks with a retryable error instead of reading it from the RPC, until
+   * `allowRpcHeaders`: the RPC may serve another chain until it is checked.
+   */
+  holdRpcHeaders(): void {
+    this.rpcHeaders = false
+  }
+
+  allowRpcHeaders(): void {
+    this.rpcHeaders = true
   }
 
   /** The logs, transactions and headers of the blocks in [from, to] that the query asks for. */

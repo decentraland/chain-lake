@@ -20,6 +20,8 @@ export interface Factory extends Contract {
 export interface DatasetConfig {
   /** The SQD portal dataset, e.g. `ethereum-mainnet`. */
   dataset: string
+  /** The chain the dataset is, checked against every source that writes its receipts. */
+  chainId: number
   fromBlock: number
   contracts: Contract[]
   factories: Factory[]
@@ -29,6 +31,7 @@ export interface DatasetConfig {
 export function loadConfig(dataset = required('DATASET')): DatasetConfig {
   const file = join(__dirname, '..', 'config', `${dataset}.json`)
   const config = JSON.parse(readFileSync(file, 'utf8')) as DatasetConfig
+  if (!(Number.isSafeInteger(config.chainId) && config.chainId > 0)) throw new Error(`${dataset}: chainId must be a chain id`)
   for (const c of [...config.contracts, ...config.factories]) {
     if (!/^0x[0-9a-f]{40}$/.test(c.address)) throw new Error(`${c.name}: ${c.address} is not a lowercase address`)
     if (c.fromBlock !== undefined && !(Number.isSafeInteger(c.fromBlock) && c.fromBlock >= 0)) throw new Error(`${c.name}: fromBlock must be a block number`)

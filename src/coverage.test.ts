@@ -9,6 +9,7 @@ const F = '0x' + 'fa'.repeat(20)
 
 const config = (addresses: string[]): DatasetConfig => ({
   dataset: 'polygon-mainnet',
+  chainId: 137,
   fromBlock: 0,
   contracts: addresses.map((address, i) => ({ name: `Contract${i}`, address })),
   factories: [{ name: 'Factory', address: F, fromBlock: 0, topic0: '0x' + 'cf'.repeat(32), addressTopic: 1 }],

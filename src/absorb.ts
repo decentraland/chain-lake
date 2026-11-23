@@ -5,12 +5,14 @@ import { join } from 'path'
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api'
 import { TableSchema } from '@subsquid/file-store-parquet'
 import { createLogger, Logger } from '@subsquid/logger'
+import { checkRpcChain } from './chain'
 import { DatasetConfig, Factory, loadConfig, required } from './config'
 import { Coverage, COVERAGE_FILE, factoriesOf, readCoverage } from './coverage'
 import { configuredContracts, RegisteredContract, Registry, REGISTRY_FILE } from './discover'
 import { fetchFollowing } from './follow/fetch'
 import { RpcClient, untilAnswered } from './follow/rpc'
 import { Chunk, Manifest, MANIFEST_FILE } from './manifest'
+import { appendReceipt, Filters, Identity, IdentitySource, lazyIdentity, Read, resolveIdentity, segmentsOf } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { Conflict, openStore, Store } from './store'
 import { columns } from './tables'
@@ -65,6 +67,11 @@ export async function absorb(options: {
   maxAttempts?: number
   /** Where the new history is staged and DuckDB spills; a new temporary directory by default, removed after. A directory given here is the caller's to remove. */
   workDir?: string
+  /**
+   * Writes a receipt of what the absorb read once its publication wins; see `receipts.ts`. The identity
+   * is asked for only once the lake is checked complete, before anything is published.
+   */
+  receipts?: { identity: IdentitySource; filters: Filters }
 }): Promise<void> {
   const { lakeDest, config, store, fetch, maxRange } = options
   const concurrency = Math.max(1, options.concurrency ?? 1)
@@ -74,6 +81,16 @@ export async function absorb(options: {
   if (!coverage?.value.complete) throw new Error(`${config.dataset}: only a complete lake takes new contracts`)
   const missing = missingContracts(config, coverage.value)
   if (missing.length === 0) return
+  if ((await store.version(MANIFEST_FILE)) === undefined || (await store.version(REGISTRY_FILE)) === undefined) throw new Error(`${config.dataset}: the lake has no manifest or registry`)
+  // The lake this absorb works on, pinned before any history is read, and named (if it is not yet) only
+  // now that it is known complete. It is checked again before each publication and before coverage is
+  // recorded, which catches some lakes switched in under a running absorb; switching a lake under any
+  // running writer is outside what is supported (see the README on restoring a lake).
+  const identity: Identity | undefined = options.receipts && (await resolveIdentity(options.receipts.identity))
+  const lakeId = identity?.lakeId ?? coverage.value.lakeId
+  const sameLake = async () => {
+    if ((await readCoverage(store))?.value.lakeId !== lakeId) throw new Error(`${config.dataset}: another lake was switched in while absorbing; nothing more is published`)
+  }
 
   const missingAddresses = new Set(missing.map((c) => c.address))
   const factories = config.factories.filter((f) => missingAddresses.has(f.address))
@@ -95,6 +112,11 @@ export async function absorb(options: {
   // The chunks written while reading, by the folder of the chunk each replaces.
   const replaced = new Map<string, Chunk>()
   const written = new Map<string, Chunk>()
+  // For the receipt: each range read with the addresses asked for, the hash each read observed at its
+  // last block, and each folder this run wrote with the folder it replaces (none in a gap).
+  const reads: Read[] = []
+  const observed = new Map<number, string>()
+  const origins = new Map<string, string | undefined>()
   const chunks = await ChunkFiles.open(lakeDest, config.dataset, join(work, 'duckdb')).catch((e) => {
     removeWork()
     throw e
@@ -112,6 +134,7 @@ export async function absorb(options: {
       if (!target.original || target.blocks.length === 0 || target.original.to > upTo) continue
       const chunk = folder(target.chunk)
       await chunks.write(chunk, target.original, staging.files(chunk.from, chunk.to))
+      origins.set(chunk.dir, target.original.dir)
       replaced.set(target.original.dir, chunk)
       staging.drop(chunk.from, chunk.to)
     }
@@ -140,6 +163,10 @@ export async function absorb(options: {
       const group = ranges.slice(i, i + concurrency)
       await inParallel(group, concurrency, async ([a, b]) => {
         const range = await fetch(followed, factories, a, b)
+        if (b === to) {
+          const end = range.blocks.find((block) => block.header.number === to)
+          if (end) observed.set(to, end.header.hash)
+        }
         const unknown = range.created.find((c) => !followed.has(c.address))
         if (unknown) throw new Error(`${config.dataset}: block ${unknown.createdAt?.block} creates ${unknown.address}, which reading the creations did not find`)
         absorbed += staging.add(a, b, range.blocks)
@@ -147,6 +174,7 @@ export async function absorb(options: {
       })
       await flush(existing, group[group.length - 1][1])
     }
+    reads.push({ from, to, addresses: [...followed] })
   }
 
   try {
@@ -160,7 +188,17 @@ export async function absorb(options: {
       if (gone) throw new Error(`${config.dataset}: chunk ${gone} left the lake while absorbing; run it again`)
       if (manifest.value.height > fetchedTo) {
         await read(fetchedTo + 1, manifest.value.height, manifest.value.chunks)
+        // A read that did not end on the block the lake holds read another branch: none of it is
+        // published, and no later read can make up for it.
+        const end = observed.get(manifest.value.height)
+        if (end === undefined || end.toLowerCase() !== manifest.value.hash.toLowerCase()) {
+          throw new Error(`${config.dataset}: the read ended at block ${manifest.value.height} with hash ${end ?? 'unknown'}, and the lake holds ${manifest.value.hash}; nothing was absorbed`)
+        }
         fetchedTo = manifest.value.height
+      } else if (reads.length && (manifest.value.height !== fetchedTo || observed.get(fetchedTo)?.toLowerCase() !== manifest.value.hash.toLowerCase())) {
+        // A retry that reads nothing new publishes what was read for the manifest it now publishes to:
+        // only if that read ended on this manifest's block.
+        throw new Error(`${config.dataset}: the lake is at block ${manifest.value.height} (${manifest.value.hash}), not where the read ended; nothing was absorbed`)
       }
 
       // What is still staged: chunks a follower added past the height read first, and the gaps.
@@ -178,11 +216,14 @@ export async function absorb(options: {
         if (!chunk) {
           chunk = folder(target.chunk)
           await chunks.write(chunk, target.original, staging.files(chunk.from, chunk.to))
+          origins.set(chunk.dir, target.original?.dir)
           written.set(key, chunk)
         }
         next.push(chunk)
       }
 
+      // A lake switched in while this one was read is not published to (a switch after this check is not caught).
+      await sameLake()
       const known = new Set(registry.value.contracts.map((c) => c.address))
       const children = [...created.values()].sort((x, y) => x.createdAt!.block - y.createdAt!.block || x.createdAt!.logIndex - y.createdAt!.logIndex)
       const added = [...missing, ...children].filter((c) => !known.has(c.address))
@@ -194,7 +235,29 @@ export async function absorb(options: {
         log.info(`the lake moved while absorbing (attempt ${attempt + 1}); reading the new blocks too`)
         continue
       }
-      await recordCoverage(store, config, factories, missingAddresses, maxAttempts)
+      // An absorb that read nothing (its contracts start past the lake's height) has nothing to receipt.
+      if (options.receipts && reads.length) {
+        // Every read was checked to end on the lake's block before anything was published.
+        const wrote = next.filter((c) => origins.has(c.dir)).map((c) => c.dir)
+        const { filters } = options.receipts
+        // The absorb is published either way: a receipt that cannot be written, or a lake switched in
+        // since, leaves it unproven.
+        await sameLake()
+          .then(() => segmentsOf(filters, reads))
+          .then((segments) =>
+            appendReceipt(store, identity!, {
+              kind: 'absorb',
+              source: 'rpc',
+              segments,
+              to: manifest.value.height,
+              toHash: manifest.value.hash,
+              wrote,
+              replaced: Object.fromEntries(wrote.flatMap((dir) => (origins.get(dir) ? [[origins.get(dir)!, dir]] : []))),
+            })
+          )
+          .catch((e) => log.error({ err: e }, `${config.dataset}: the absorb got no receipt`))
+      }
+      await recordCoverage(store, config, factories, missingAddresses, maxAttempts, lakeId)
       log.info(`absorbed ${missing.length} contracts and ${created.size} they created: ${absorbed} blocks into ${replaced.size + written.size} chunks`)
       return
     }
@@ -213,9 +276,11 @@ export async function absorb(options: {
  * Another process may record coverage meanwhile (a second task absorbing the same contracts): the
  * record is then read again and merged, as both hold the same history.
  */
-async function recordCoverage(store: Store, config: DatasetConfig, absorbed: Factory[], addresses: Set<string>, maxAttempts: number): Promise<void> {
+async function recordCoverage(store: Store, config: DatasetConfig, absorbed: Factory[], addresses: Set<string>, maxAttempts: number, lakeId: string | undefined): Promise<void> {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const current = (await readCoverage(store))!
+    // Only the lake the absorb published to: another switched in since does not hold this history.
+    if (current.value.lakeId !== lakeId) throw new Error(`${config.dataset}: another lake was switched in before its coverage was recorded; it is left as it was`)
     const contracts = [...new Set([...current.value.contracts, ...addresses])].sort()
     const factories = { ...factoriesOf(config), ...current.value.factories }
     for (const f of absorbed) factories[f.address] = f.fromBlock
@@ -407,16 +472,19 @@ class ChunkFiles {
   }
 }
 
-async function main() {
-  const config = loadConfig()
-  const lakeDest = required('LAKE_DEST')
-  const store = openStore(lakeDest, config.dataset)
-  const rpc = new RpcClient(rpcUrl(config.dataset))
+/**
+ * The `absorb` command for one dataset: refuses an RPC serving another chain, then absorbs what the
+ * config gained. Nothing is written to a lake that is not complete, the lake's name included.
+ */
+export async function absorbDataset(config: DatasetConfig, lakeDest: string, store: Store, rpc: RpcClient): Promise<void> {
   const perCall = Number(process.env.ADDRESSES_PER_CALL || 500)
+  // What it reads is receipted as this dataset's: an RPC serving another chain stops it here.
+  await checkRpcChain(rpc, config, logger)
   await absorb({
     lakeDest,
     config,
     store,
+    receipts: { identity: lazyIdentity(store, config), filters: new Filters(store) },
     maxRange: Number(process.env.ABSORB_MAX_RANGE || 10_000),
     concurrency: Number(process.env.ABSORB_CONCURRENCY || 4),
     // RPC trouble is waited out however long it lasts, as the follower does: giving up would start the
@@ -424,6 +492,12 @@ async function main() {
     fetch: (followed, factories, from, to) =>
       untilAnswered(`${config.dataset}: reading blocks ${from}-${to}`, () => fetchFollowing(rpc, followed, factories, perCall, from, to), logger),
   })
+}
+
+async function main() {
+  const config = loadConfig()
+  const lakeDest = required('LAKE_DEST')
+  await absorbDataset(config, lakeDest, openStore(lakeDest, config.dataset), new RpcClient(rpcUrl(config.dataset)))
 }
 
 if (require.main === module) {

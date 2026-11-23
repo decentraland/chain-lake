@@ -33,6 +33,8 @@ contract and the topic that holds its address, and `contracts.json` records ever
 <lake>/<dataset>/manifest.json                            the last block the lake holds, and the chunks that hold it
 <lake>/<dataset>/contracts.json                           the contracts followed
 <lake>/<dataset>/coverage.json                            whose history the lake holds, and whether its backfill is complete
+<lake>/<dataset>/scans-<lakeId>.json                      a receipt of what each publication read, and with which filter
+<lake>/<dataset>/filter-<sha256>.json                     the addresses a read asked for, named by their digest
 <lake>/<dataset>/chunks/<from>-<to>-<writer>/blocks.parquet
 <lake>/<dataset>/chunks/<from>-<to>-<writer>/logs.parquet
 <lake>/<dataset>/chunks/<from>-<to>-<writer>/transactions.parquet
@@ -43,6 +45,56 @@ read.
 
 Addresses and hashes are lowercase hex strings, so the files read the same in DuckDB, Athena or
 Spark.
+
+### Scan receipts
+
+`scans-<lakeId>.json` records what each publication of the lake read, so a reader can tell from which
+block the lake holds every log of an address, without trusting the config or `coverage.json`:
+
+- Every commit a writer wins, and every absorb that wins its manifest, adds a receipt once published:
+  the intervals it read, each with the filter it read them with, the block it ends at with the hash
+  the read observed there, and the chunk folders it added or replaced. A commit that holds no chunk
+  gets one too: its blocks were read and held nothing.
+- A filter is an immutable `filter-<sha256>.json`: the addresses a read asked for. One that only grew
+  names the one before and lists what it added. The follower's filter is the configured contracts,
+  the factories and every contract on file, with the contracts a range created, read again from the
+  range's first block; an absorb's is the contracts it absorbs and those they created.
+- A commit counts for a reader's manifest once that manifest reached its end; an absorb, once every
+  chunk it wrote is listed, or replaced by a later absorb's; an absorb that read no log, once the
+  manifest reached its end. An absorb whose read ends on another hash than the lake holds at that
+  height publishes nothing and fails. A receipt whose id is not the digest of what it says proves
+  nothing; one that cannot be written is logged, and never stops a writer or an absorb. A missed receipt
+  is never retried: for each address, any interval without another receipt covering it limits how far
+  back its coverage extends.
+- An absorb's claims rest on the chunks it wrote: if a later absorb rewrites them and its own receipt
+  cannot be written, the earlier absorb's addresses lose their proof (they are under-claimed, never
+  over-claimed) until the lake is receipted again.
+- An address is held from the first block of the longest run of blocks, ending at the highest
+  receipted block, that the filters asking for it cover without a gap. Blocks a build without receipts
+  committed are such a gap. A backfill claims nothing below the block it starts from.
+- Each receipt belongs to one lake: its dataset, its `chainId` and its `lakeId`, which names its ledger
+  file. A lake gets its `lakeId` once it has a manifest: when `live` or `absorb` starts on a lake without
+  one, or with the first receipt of a lake a backfill or a development follow started. Naming the lake
+  at start is part of starting: a storage failure there ends the process, as any storage failure does. A lake
+  rebuilt from `discover` gets a new one, so a late writer of the lake it replaced never touches the new
+  ledger. A backfill or a development follow refuses to start a lake from nothing where the coverage
+  still names one (its manifest gone): start it in an empty location. A lake restored from a copy needs
+  the ledger and filters of that same copy, or none.
+
+**Restoring or replacing a lake.** Before a lake's location is restored from a copy or replaced by
+another lake, even by switching a complete copy in at once, stop every process that writes it (`live`,
+`follow`, `backfill`, `absorb`) and let it finish. Writers stay bound to the location they started on
+for as long as they publish: switching it under a running writer is not supported. The checks the
+writers make (a commit's receipt only while the manifest is the one it published, an absorb's lake
+pinned before it publishes and before it records coverage) catch some such switches, not all. Readers
+are a separate matter: take a static `serve` offline while a lake is restored in place, or switch a
+complete copy in at once.
+
+Each dataset's config names its `chainId`. `live`, `follow` and `absorb` refuse an RPC endpoint that
+serves another chain, and `backfill` refuses a portal whose finalized block differs from the RPC's at
+that height. `live` serves a complete lake as it stands while it checks the RPC, so an RPC outage at
+start holds back only new blocks; until the check passes, a header the lake's files lack is a 503
+rather than one read from that RPC.
 
 ## Commands
 

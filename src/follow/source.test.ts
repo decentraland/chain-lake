@@ -5,6 +5,7 @@ import { Registry } from '../discover'
 import { RpcCall, RpcClient, RpcError, RpcRejected } from './rpc'
 import { ForkedLog, getLogs, NodeBehind, rangeTooWide } from './fetch'
 import { RpcSource } from './source'
+import { ScanLog } from '../receipts'
 
 const FACTORY = '0x' + 'fa'.repeat(20)
 const STATIC = '0x' + '5a'.repeat(20)
@@ -74,6 +75,7 @@ function fakeRpc(logs: FakeLog[], options: { maxRange?: number; corruptHashOf?: 
 
 const config: DatasetConfig = {
   dataset: 'polygon-mainnet',
+  chainId: 137,
   fromBlock: 0,
   contracts: [{ name: 'Static', address: STATIC }],
   factories: [{ name: 'Factory', address: FACTORY, fromBlock: 0, topic0: PROXY_CREATED, addressTopic: 1 }],
@@ -187,4 +189,17 @@ test('the header of the range end is asked before its logs, in the same batch', 
 test('a provider cap on addresses per call ends the run instead of splitting ranges forever', async () => {
   const { client } = fakeRpc(chain, { error: 'too many addresses: the limit is 100' })
   await assert.rejects(source(client).s.range(10, 20), RpcRejected)
+})
+
+test('each range read is logged with the addresses asked for over the whole of it, a factory left out of the config still following its children', async () => {
+  const { client } = fakeRpc(chain)
+  const scans = ScanLog.reading()
+  const registry: Registry = { dataset: config.dataset, height: 9, contracts: [{ name: 'Static', address: STATIC }] }
+  await new RpcSource(client, config, registry, async () => {}, { maxRange: 100, addressesPerCall: 500, pollMs: 1, scans }).range(10, 20)
+  assert.deepEqual(scans.take(10, 20), [{ from: 10, to: 20, addresses: [CREATED, FACTORY, STATIC].sort() }])
+
+  // Without the factory in its config, the children on file are still read; new ones are no longer found.
+  const later = new RpcSource(client, { ...config, factories: [] }, registry, async () => {}, { maxRange: 100, addressesPerCall: 500, pollMs: 1, scans })
+  await later.range(21, 30)
+  assert.deepEqual(scans.take(21, 30), [{ from: 21, to: 30, addresses: [CREATED, STATIC].sort() }])
 })

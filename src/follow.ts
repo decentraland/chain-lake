@@ -1,11 +1,13 @@
 import { run } from '@subsquid/batch-processor'
 import { createLogger } from '@subsquid/logger'
+import { checkRpcChain } from './chain'
 import { blockFromEnv, loadConfig, required } from './config'
-import { markPartial } from './coverage'
+import { markPartial, readCoverage } from './coverage'
 import { openRegistry } from './discover'
 import { RpcClient } from './follow/rpc'
 import { RpcSource } from './follow/source'
 import { Manifest, MANIFEST_FILE } from './manifest'
+import { Filters, lazyIdentity, refuseReplacedLake, ScanLog } from './receipts'
 import { rpcUrl } from './serve/headers'
 import { openStore } from './store'
 import { writeBlocks } from './write'
@@ -22,14 +24,18 @@ async function main() {
   const lakeDest = required('LAKE_DEST')
   const store = openStore(lakeDest, config.dataset)
   const stop = blockFromEnv('STOP_BLOCK')
+  // Checked before anything is read from it, the parent of a new development lake included.
+  const rpc = new RpcClient(rpcUrl(config.dataset))
+  await checkRpcChain(rpc, config, logger)
 
   // The follower continues a lake; on an empty one it would start from block 0 over RPC. It needs
   // the backfill's manifest, or an explicit FROM_BLOCK to start a development lake.
   if (!(await store.read(MANIFEST_FILE))) {
     const from = blockFromEnv('FROM_BLOCK')
     if (from === undefined) throw new Error(`${config.dataset} has no lake to continue: run the backfill first, or set FROM_BLOCK`)
+    await refuseReplacedLake(store, config)
     // Block 0 has no parent: the lake starts empty, as file-store's own initial state does.
-    const parent = from === 0 ? '0x' : (await new RpcClient(rpcUrl(config.dataset)).call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])).hash
+    const parent = from === 0 ? '0x' : (await rpc.call<{ hash: string }>('eth_getBlockByNumber', ['0x' + (from - 1).toString(16), false])).hash
     if (from > 0) await markPartial(store, config, `a development lake started at block ${from} left out the history before it`)
     await store.write<Manifest>(MANIFEST_FILE, { height: from - 1, hash: parent, chunks: [] }, null)
     logger.info(`starting a new lake at block ${from}`)
@@ -38,15 +44,25 @@ async function main() {
   // The lake's state first, then the registry, as in live: the writer starts from exactly that state.
   const pinned = (await store.read<Manifest>(MANIFEST_FILE))!
   const { registry, save } = await openRegistry(store)
-  const source = new RpcSource(new RpcClient(rpcUrl(config.dataset)), config, registry, save, {
+  // A lake no coverage record names (a development lake from block 0) gets no receipts. The others are
+  // named by their first receipt, once their manifest exists.
+  const identity = (await readCoverage(store)) ? lazyIdentity(store, config) : undefined
+  // Reads are kept for a receipt only when there will be one.
+  const scans = identity && ScanLog.reading()
+  const source = new RpcSource(rpc, config, registry, save, {
     maxRange: Number(process.env.MAX_RANGE || 2000),
     addressesPerCall: Number(process.env.ADDRESSES_PER_CALL || 500),
     pollMs: Number(process.env.POLL_MS || 5000),
     // STOP_BLOCK bounds a run, for comparisons; without it the follower keeps up with the chain.
     stopBlock: stop,
+    scans,
   })
 
-  const db = openWriter(lakeDest, config.dataset, store, { chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64), startAt: pinned.version })
+  const db = openWriter(lakeDest, config.dataset, store, {
+    chunkSizeMb: Number(process.env.CHUNK_SIZE_MB || 64),
+    startAt: pinned.version,
+    receipts: identity && scans && { identity, source: 'rpc', lowerBound: pinned.value.height + 1, scans, filters: new Filters(store), log: logger },
+  })
 
   logger.info(`following ${config.dataset}: ${registry.contracts.length} contracts, registry at block ${registry.height}`)
   run(source, db, async (ctx) => {

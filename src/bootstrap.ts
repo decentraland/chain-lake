@@ -1,10 +1,10 @@
 import { Logger } from '@subsquid/logger'
 import { DatasetConfig } from './config'
 import { missingContracts } from './absorb'
-import { checkCoverage, COVERAGE_FILE, readCoverage } from './coverage'
+import { checkCoverage, Coverage, COVERAGE_FILE, readCoverage } from './coverage'
 import { Registry, REGISTRY_FILE } from './discover'
 import { Manifest, MANIFEST_FILE } from './manifest'
-import { Store } from './store'
+import { Conflict, Store } from './store'
 
 /**
  * Makes a dataset ready to follow. One whose backfill is not complete gets it first, from the SQD
@@ -54,6 +54,27 @@ export async function bootstrap(
   }
   const reached = await written()
   if (reached < registry.height) throw new Error(`${config.dataset}: the backfill ended at block ${reached}, short of ${registry.height}`)
-  await store.write(COVERAGE_FILE, { ...coverage.value, complete: { height: registry.height } }, coverage.version)
+  await recordComplete(store, config, registry.height)
   log?.info(`backfill complete up to block ${registry.height}`)
+}
+
+/**
+ * Records the backfill complete on the coverage as it stands now: the backfill wrote it meanwhile (it
+ * names the lake for its receipts), and what it wrote stays. A lake it marked partial is refused, with
+ * its marker kept and `complete` left unset.
+ */
+async function recordComplete(store: Store, config: DatasetConfig, height: number, attempts = 5): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const current = await readCoverage(store)
+    if (!current) throw new Error(`${config.dataset}: the coverage record disappeared during the backfill`)
+    // A lake the backfill marked partial meanwhile is refused, as any start would refuse it.
+    checkCoverage(config, current.value)
+    try {
+      await store.write<Coverage>(COVERAGE_FILE, { ...current.value, complete: { height } }, current.version)
+      return
+    } catch (e) {
+      if (!(e instanceof Conflict)) throw e
+    }
+  }
+  throw new Error(`${config.dataset}: the coverage kept changing while recording the backfill complete`)
 }

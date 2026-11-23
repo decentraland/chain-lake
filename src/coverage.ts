@@ -18,6 +18,13 @@ export interface Coverage {
   complete?: { height: number }
   /** Set by a development run that left history out. Such a lake is never served. */
   partial?: string
+  /**
+   * Names this lake for its scan receipts, whose ledger is `scans-<lakeId>.json`. Set once the lake has a
+   * manifest: by `live` or `absorb` when they start on a lake without one, or by the first receipt of a
+   * lake a backfill or a development follow started. A lake rebuilt from `discover` gets a new one, so the
+   * receipts of the lake it replaced prove nothing for it.
+   */
+  lakeId?: string
 }
 
 export function coverageOf(config: DatasetConfig): Coverage {

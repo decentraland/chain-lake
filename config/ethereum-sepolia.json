@@ -1,5 +1,6 @@
 {
   "dataset": "ethereum-sepolia",
+  "chainId": 11155111,
   "fromBlock": 3831219,
   "contracts": [
     {

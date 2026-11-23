@@ -10,10 +10,10 @@ import { REGISTRY_FILE } from './discover'
 import { MANIFEST_FILE } from './manifest'
 import { openStore, Store } from './store'
 
-const config: DatasetConfig = { dataset: 'polygon-mainnet', fromBlock: 0, contracts: [{ name: 'Static', address: '0x' + 'aa'.repeat(20) }], factories: [] }
+const config: DatasetConfig = { dataset: 'polygon-mainnet', chainId: 137, fromBlock: 0, contracts: [{ name: 'Static', address: '0x' + 'aa'.repeat(20) }], factories: [] }
 
 /** A store in a fresh directory, and stand-ins for discover and backfill that record their runs. */
-async function setup(t: TestContext, prepare: (store: Store) => Promise<void>, backfillTo = 100) {
+async function setup(t: TestContext, prepare: (store: Store) => Promise<void>, backfillTo = 100, duringBackfill?: (store: Store) => Promise<void>) {
   const lakeDir = mkdtempSync(join(tmpdir(), 'chain-lake-'))
   t.after(() => rmSync(lakeDir, { recursive: true, force: true }))
   const store = openStore(lakeDir, config.dataset)
@@ -26,6 +26,10 @@ async function setup(t: TestContext, prepare: (store: Store) => Promise<void>, b
     } else {
       const current = await store.read(MANIFEST_FILE)
       await store.write(MANIFEST_FILE, { height: backfillTo, hash: '0x', chunks: [] }, current?.version ?? null)
+      // The backfill names the lake for its receipts, as `identityOf` does.
+      const coverage = (await store.read<Coverage>(COVERAGE_FILE))!
+      if (!coverage.value.lakeId) await store.write<Coverage>(COVERAGE_FILE, { ...coverage.value, lakeId: 'named by the backfill' }, coverage.version)
+      await duringBackfill?.(store)
     }
   }
   await prepare(store)
@@ -36,7 +40,9 @@ test('a new dataset is discovered, backfilled and recorded as complete', async (
   const { store, ran, go } = await setup(t, async () => {})
   await go()
   assert.deepEqual(ran, ['discover.js', 'backfill.js'])
-  assert.deepEqual((await store.read<Coverage>(COVERAGE_FILE))!.value.complete, { height: 100 })
+  const coverage = (await store.read<Coverage>(COVERAGE_FILE))!.value
+  assert.deepEqual(coverage.complete, { height: 100 })
+  assert.equal(coverage.lakeId, 'named by the backfill', 'what the backfill wrote is kept')
 
   // From then on, nothing runs.
   ran.length = 0
@@ -74,4 +80,16 @@ test('a lake missing history is refused', async (t) => {
     await store.write(COVERAGE_FILE, { ...coverageOf(config), partial: 'a development backfill left history out' }, null)
   })
   await assert.rejects(go(), /never served/)
+})
+
+test('a lake the backfill marked partial is refused, with its marker and name kept and nothing recorded complete', async (t) => {
+  const { store, go } = await setup(t, async () => {}, 100, async (store) => {
+    const coverage = (await store.read<Coverage>(COVERAGE_FILE))!
+    await store.write<Coverage>(COVERAGE_FILE, { ...coverage.value, partial: 'a development backfill left history out' }, coverage.version)
+  })
+  await assert.rejects(go(), /never served/)
+  const coverage = (await store.read<Coverage>(COVERAGE_FILE))!.value
+  assert.equal(coverage.partial, 'a development backfill left history out')
+  assert.equal(coverage.lakeId, 'named by the backfill')
+  assert.equal(coverage.complete, undefined)
 })
